@@ -7,9 +7,9 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetSystemMetrics, LoadIconW,
+    AppendMenuW, CheckMenuItem, CreatePopupMenu, DestroyMenu, GetCursorPos, GetSystemMetrics, LoadIconW,
     LoadImageW, SetForegroundWindow, TrackPopupMenu, HICON, IDI_APPLICATION, IMAGE_ICON, LR_SHARED,
-    MF_SEPARATOR, MF_STRING, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    MF_BYCOMMAND, MF_CHECKED, MF_SEPARATOR, MF_STRING, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
 };
 
 use crate::app;
@@ -44,6 +44,7 @@ pub const MENU_CAPTURE_WINDOW: usize = 2002;
 pub const MENU_CAPTURE_FULL: usize = 2003;
 pub const MENU_OPEN_FOLDER: usize = 2004;
 pub const MENU_EXIT: usize = 2005;
+pub const MENU_AUTOSTART: usize = 2006;
 
 pub fn add_icon(hwnd: HWND, tooltip: &str) {
     let data = build_nid(hwnd, tooltip);
@@ -73,6 +74,19 @@ pub fn show_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, MF_STRING, MENU_CAPTURE_WINDOW, w!("Снимок окна\tCtrl+PrtSc"));
         let _ = AppendMenuW(menu, MF_STRING, MENU_CAPTURE_FULL, w!("Снимок экрана\tShift+PrtSc"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        let autostart = crate::autostart::is_enabled();
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_AUTOSTART,
+            w!("Запускать при старте Windows"),
+        );
+        if autostart {
+            let _ = CheckMenuItem(menu, MENU_AUTOSTART as u32, MF_BYCOMMAND.0 | MF_CHECKED.0);
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
         let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN_FOLDER, w!("Открыть папку снимков"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Выход"));

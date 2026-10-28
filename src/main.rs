@@ -3,6 +3,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod autostart;
 mod capture;
 mod clipboard;
 #[allow(dead_code)]
@@ -17,9 +18,12 @@ mod tray;
 mod ui;
 
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -86,6 +90,29 @@ unsafe extern "system" fn tray_wndproc(
                             None,
                             SW_SHOWNORMAL,
                         );
+                    }
+                }
+                tray::MENU_AUTOSTART => {
+                    let enable = !autostart::is_enabled();
+                    match autostart::set_enabled(enable) {
+                        Ok(()) => {
+                            let line = if enable {
+                                "CopyX будет запускаться вместе с Windows"
+                            } else {
+                                "CopyX больше не будет запускаться сам"
+                            };
+                            toast::show_status(
+                                if enable {
+                                    "Автозапуск включён"
+                                } else {
+                                    "Автозапуск отключён"
+                                },
+                                &[line],
+                            );
+                        }
+                        Err(err) => {
+                            toast::show_status("Не удалось изменить автозапуск", &[err.as_str()]);
+                        }
                     }
                 }
                 tray::MENU_EXIT => {
@@ -160,6 +187,25 @@ fn main() {
         let instance = GetModuleHandleW(None).unwrap().into();
 
         app::init(instance);
+
+        // Один экземпляр: при автозапуске и ручном старте не должно быть двух
+        // иконок в трее. Хэндл мьютекса живёт до завершения процесса.
+        if let Ok(_guard) = CreateMutexW(None, true, w!("Local\\CopyX.SingleInstance")) {
+            // HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) — мьютекс уже кем-то открыт.
+            const ALREADY_EXISTS: i32 = 0x8007_00B7u32 as i32;
+            if GetLastError()
+                .err()
+                .is_some_and(|err| err.code().0 == ALREADY_EXISTS)
+            {
+                MessageBoxW(
+                    None,
+                    w!("CopyX уже запущен — его значок находится в трее."),
+                    w!("CopyX"),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+                return;
+            }
+        }
 
         let class_name = w!("CopyXTray");
         let class = WNDCLASSW {

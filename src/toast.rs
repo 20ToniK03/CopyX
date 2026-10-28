@@ -64,8 +64,8 @@ enum Button {
 enum Kind {
     /// Уведомление о готовом снимке.
     Capture { copied: bool },
-    /// Уведомление о запуске приложения.
-    Started,
+    /// Короткое служебное сообщение с иконкой приложения.
+    Status,
 }
 
 struct Toast {
@@ -75,6 +75,8 @@ struct Toast {
     thumb_rect: RECT,
     save_rect: RECT,
     hide_rect: RECT,
+    /// Заголовок карточки.
+    title: String,
     /// Y-координата первой строки подписи.
     lines_top: i32,
     lines: Vec<String>,
@@ -150,6 +152,11 @@ pub fn show(image: CapturedImage, clipboard_ok: bool) {
 
     let lines_top = save_rect.top + (btn_h - sc(15)) / 2;
     let subtitle = format!("PNG · {} × {}", image.width, image.height);
+    let title = if clipboard_ok {
+        "Скопировано в буфер обмена"
+    } else {
+        "Снимок готов"
+    };
     let toast = Toast {
         image: Some(Arc::new(image)),
         thumb,
@@ -157,6 +164,7 @@ pub fn show(image: CapturedImage, clipboard_ok: bool) {
         thumb_rect,
         save_rect,
         hide_rect,
+        title: title.to_string(),
         lines_top,
         lines: vec![subtitle],
         dpi,
@@ -172,6 +180,17 @@ pub fn show(image: CapturedImage, clipboard_ok: bool) {
 
 /// Короткое уведомление «программа запущена» в правом нижнем углу.
 pub fn show_started() {
+    show_status(
+        "CopyX запущен",
+        &[
+            "PrtSc — снимок области",
+            "Ctrl+PrtSc — окно · Shift+PrtSc — экран",
+        ],
+    );
+}
+
+/// Служебное уведомление с иконкой приложения и произвольным заголовком.
+pub fn show_status(title: &str, lines: &[&str]) {
     hidden();
 
     let mut cursor = POINT::default();
@@ -188,10 +207,7 @@ pub fn show_started() {
     let line_gap = sc(2);
     let btn_h = sc(26);
 
-    let lines = vec![
-        "PrtSc — снимок области".to_string(),
-        "Ctrl+PrtSc — окно · Shift+PrtSc — экран".to_string(),
-    ];
+    let lines: Vec<String> = lines.iter().map(|line| (*line).to_string()).collect();
 
     let lines_top = pad + title_h + sc(4);
     let height = lines_top + (line_h + line_gap) * lines.len() as i32 - line_gap + pad;
@@ -217,10 +233,11 @@ pub fn show_started() {
         thumb_rect: RECT::default(),
         save_rect: RECT::default(),
         hide_rect,
+        title: title.to_string(),
         lines_top,
         lines,
         dpi,
-        kind: Kind::Started,
+        kind: Kind::Status,
         hot: None,
         hovered: false,
     };
@@ -650,18 +667,14 @@ fn paint_toast(hwnd: HWND) {
         right: pad + icon_size,
         bottom: pad + sc(1) + icon_size,
     };
-    let started = toast.kind == Kind::Started;
-    if started {
+    let is_status = toast.kind == Kind::Status;
+    if is_status {
         draw_app_icon(hdc, &icon_rect, dpi);
     } else {
         draw_check_icon(hdc, &icon_rect, dpi);
     }
 
-    let title = match toast.kind {
-        Kind::Capture { copied: true } => "Скопировано в буфер обмена",
-        Kind::Capture { copied: false } => "Снимок готов",
-        Kind::Started => "CopyX запущен",
-    };
+    let title = toast.title.as_str();
     let title_font = ui::make_font(sc(14), 600);
     ui::draw_text(
         hdc,
