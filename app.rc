@@ -1,0 +1,3 @@
+// Иконка приложения CopyX.
+// app.ico собран из app.svg (16–256 px, DIB + PNG@256).
+1 ICON "app.ico"

@@ -1,0 +1,8 @@
+[package]
+name = "copyx-core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "copyx_core"
+path = "src/lib.rs"
