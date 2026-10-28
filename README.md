@@ -2,6 +2,10 @@
 
 Rust-only MVP ShareX-подобного инструмента для Windows.
 
+## Скачать
+
+Готовый `CopyX-0.1.0.exe` — в разделе [Releases](https://github.com/20ToniK03/CopyX/releases/latest). Установка не требуется, Windows 10/11 x64.
+
 ## Запуск EXE
 
 Готовый файл находится здесь:
