@@ -88,6 +88,16 @@ struct Toast {
 
 static TOAST: Mutex<Option<Toast>> = Mutex::new(None);
 
+/// Кадр тоста тоже собирается в отдельном bitmap и выводится одним BitBlt:
+/// иначе при наведении курсора карточка «дрожит» из-за пошаговой отрисовки.
+struct FrameBuffer {
+    width: i32,
+    height: i32,
+    bitmap: BitmapDc,
+}
+
+static TOAST_FRAME: Mutex<Option<FrameBuffer>> = Mutex::new(None);
+
 /// Show a capture as a glass toast in the bottom-right corner.
 pub fn show(image: CapturedImage, clipboard_ok: bool) {
     hidden();
@@ -279,7 +289,6 @@ fn present(width: i32, height: i32, mut toast: Toast, on_primary: bool) {
         let instance = app::with_state(|s| s.instance);
         let class_name = w!("CopyXToast");
         let class = WNDCLASSW {
-            style: CS_DROPSHADOW,
             hInstance: instance,
             lpfnWndProc: Some(toast_proc),
             lpszClassName: class_name,
@@ -325,7 +334,8 @@ fn present(width: i32, height: i32, mut toast: Toast, on_primary: bool) {
             *slot = Some(toast);
         }
 
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);        let _ = SetTimer(hwnd, TIMER_HIDE, AUTO_HIDE_MS, None);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = SetTimer(hwnd, TIMER_HIDE, AUTO_HIDE_MS, None);
         let _ = InvalidateRect(hwnd, None, false);
         let _ = UpdateWindow(hwnd);
     }
@@ -459,11 +469,31 @@ unsafe extern "system" fn toast_proc(
 
         WM_ERASEBKGND => LRESULT(1),
 
+        WM_SETCURSOR => {
+            let hit = (lparam.0 as u32) & 0xFFFF;
+            if hit == HTCLIENT as u32 {
+                let hand = TOAST
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().and_then(|t| t.hot))
+                    .is_some();
+                unsafe {
+                    let _ = SetCursor(
+                        LoadCursorW(None, if hand { IDC_HAND } else { IDC_ARROW })
+                            .unwrap_or_default(),
+                    );
+                }
+                LRESULT(1)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+
         WM_MOUSEMOVE => {
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
 
-            let (was_hovered, hot) = {
+            let (was_hovered, hot, changed) = {
                 let mut guard = match TOAST.lock() {
                     Ok(g) => g,
                     Err(_) => return LRESULT(0),
@@ -483,12 +513,23 @@ unsafe extern "system" fn toast_proc(
                 } else {
                     None
                 };
-                if toast.hot != hot {
+                let changed = toast.hot != hot;
+                if changed {
                     toast.hot = hot;
                     let _ = InvalidateRect(hwnd, None, false);
                 }
-                (was_hovered, hot)
+                (was_hovered, hot, changed)
             };
+
+            // Курсор меняем только в момент перехода, иначе он дёргается.
+            if changed {
+                unsafe {
+                    let _ = SetCursor(
+                        LoadCursorW(None, if hot.is_some() { IDC_HAND } else { IDC_ARROW })
+                            .unwrap_or_default(),
+                    );
+                }
+            }
 
             if !was_hovered {
                 let mut track = TRACKMOUSEEVENT {
@@ -500,14 +541,6 @@ unsafe extern "system" fn toast_proc(
                 let _ = TrackMouseEvent(&mut track);
             }
 
-            unsafe {
-                let cursor = if hot.is_some() {
-                    LoadCursorW(None, IDC_HAND)
-                } else {
-                    LoadCursorW(None, IDC_ARROW)
-                };
-                let _ = SetCursor(cursor.unwrap_or_default());
-            }
             LRESULT(0)
         }
 
@@ -587,6 +620,9 @@ unsafe extern "system" fn toast_proc(
             if let Ok(mut slot) = TOAST.lock() {
                 *slot = None;
             }
+            if let Ok(mut frame) = TOAST_FRAME.lock() {
+                *frame = None;
+            }
             LRESULT(0)
         }
 
@@ -602,7 +638,54 @@ fn paint_toast(hwnd: HWND) {
     unsafe {
         let _ = GetClientRect(hwnd, &mut client);
     }
+    let width = client.right - client.left;
+    let height = client.bottom - client.top;
+    if width < 1 || height < 1 {
+        return;
+    }
 
+    let screen = ScreenDc::for_screen();
+    let mut frame = match TOAST_FRAME.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            paint_toast_scene(hdc, &client);
+            return;
+        }
+    };
+
+    let stale = frame
+        .as_ref()
+        .map_or(true, |buffer| buffer.width != width || buffer.height != height);
+    if stale {
+        *frame = BitmapDc::compatible(screen.handle(), width, height).map(|bitmap| FrameBuffer {
+            width,
+            height,
+            bitmap,
+        });
+    }
+
+    match frame.as_ref() {
+        Some(buffer) => {
+            paint_toast_scene(buffer.bitmap.handle(), &client);
+            unsafe {
+                let _ = BitBlt(
+                    hdc,
+                    0,
+                    0,
+                    width,
+                    height,
+                    buffer.bitmap.handle(),
+                    0,
+                    0,
+                    SRCCOPY,
+                );
+            }
+        }
+        None => paint_toast_scene(hdc, &client),
+    }
+}
+
+fn paint_toast_scene(hdc: HDC, client: &RECT) {
     let guard = match TOAST.lock() {
         Ok(g) => g,
         Err(_) => return,
@@ -632,12 +715,12 @@ fn paint_toast(hwnd: HWND) {
     } else {
         let brush = GdiBrush::solid(PANEL_BG);
         unsafe {
-            let _ = FillRect(hdc, &client, brush.handle());
+            let _ = FillRect(hdc, client, brush.handle());
         }
     }
 
     // Мягкий блик сверху — «стеклянная» поверхность карточки.
-    ui::sheen(hdc, &client, 44, 0);
+    ui::sheen(hdc, client, 44, 0);
 
     let radius = sc(16);
     let border_rect = RECT {
@@ -762,7 +845,9 @@ fn draw_button(hdc: HDC, rect: &RECT, text: &str, primary: bool, hot: bool, dpi:
         let tint = if hot { HIDE_GLASS_HOT } else { HIDE_GLASS };
         (tint, if hot { 170 } else { 135 }, BORDER)
     };
-    ui::frosted_round_rect(hdc, rect, radius, tint, alpha, border, 52);
+    // Фон под тостом уже размыт — кнопке достаточно тонировки, без
+    // повторного размытия на каждую перерисовку.
+    ui::tint_round_rect(hdc, rect, radius, tint, alpha, border, 52);
 
     let font = ui::make_font(ui::scale(13, dpi), 600);
     let size = ui::measure_text(hdc, text, font);
