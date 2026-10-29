@@ -21,6 +21,7 @@ use crate::toast;
 use crate::ui;
 use copyx_core::CaptureState;
 use std::mem::size_of;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::w;
@@ -46,14 +47,20 @@ const PANEL_BG: u32 = 0x00221612; // тёмное "стекло" RGB(18, 22, 34)
 const PANEL_BG_BGRA: [u8; 4] = [0x12, 0x16, 0x22, 255]; // тот же цвет в BGRA
 const SIZE_BG_BGRA: [u8; 4] = [0x6E, 0x34, 0x18, 255]; // тёмно-синее стекло для размера
 const PANEL_BORDER: u32 = 0x00785A46; // RGB(70, 90, 120)
+const GLASS_BORDER: u32 = 0x00BE9A7A; // RGB(122, 154, 190) — светлая стеклянная кромка
 const COPY_BORDER: u32 = 0x00FFE6D2; // светлая кромка акцентной кнопки
 const TEXT_MAIN: u32 = 0x00FFFFFF;
 const TEXT_MUTED: u32 = 0x00D8C8B4; // RGB(180, 200, 216)
 const WHITE: u32 = 0x00FFFFFF;
 const ANNOTATION: u32 = 0x004D5AFF; // RGB(255, 90, 77) — тёплый красный
 
-const HINT_TEXT: &str =
-    "ЛКМ — область · 1–7 — инструменты · Enter — копировать · Esc/ПКМ — отмена";
+/// Подсказка, пока область ещё не выделена.
+const HINT_SELECT: &str =
+    "Зажмите ЛКМ и выделите область · короткий клик — окно · Esc/ПКМ — отмена";
+
+/// Подсказка редактора: панель инструментов уже доступна.
+const HINT_EDIT: &str =
+    "1–7 — инструменты · Enter/Ctrl+C — копировать · Ctrl+Z — шаг назад · Esc/ПКМ — закрыть";
 
 /// Кнопки панели инструментов.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,6 +72,8 @@ enum ToolbarHit {
 struct ToolbarLayout {
     panel: RECT,
     buttons: Vec<(RECT, ToolbarHit)>,
+    /// Тонкая линия-разделитель перед акцентной кнопкой «Копировать».
+    separator: Option<RECT>,
 }
 
 pub fn show(instance: HINSTANCE) {
@@ -144,6 +153,7 @@ pub fn hide() {
         }
     }
     snapshot::clear();
+    clear_back_buffer();
 }
 
 fn create_overlay(instance: HINSTANCE) {
@@ -682,7 +692,8 @@ fn undo(hwnd: HWND) {
 
 fn set_tool(hwnd: HWND, tool: Tool) {
     let changed = app::with_state(|s| {
-        if s.pointer_down {
+        // До выделения области панель инструментов недоступна.
+        if s.pointer_down || !s.selection.active {
             return false;
         }
         let changed = s.tool != tool;
@@ -821,6 +832,30 @@ fn make_effect(tool: Tool, rect: &RECT, dpi: u32) -> Option<BitmapDc> {
 // Отрисовка оверлея
 // ---------------------------------------------------------------------------
 
+/// Кадр оверлея рисуется в постоянный bitmap, а затем одной операцией
+/// копируется в окно. Без этого GDI показывает промежуточные состояния
+/// (фон, затем панели, затем текст), и при движении мыши экран мерцает.
+struct BackBuffer {
+    width: i32,
+    height: i32,
+    bitmap: BitmapDc,
+}
+
+static BACK_BUFFER: OnceLock<Mutex<Option<BackBuffer>>> = OnceLock::new();
+
+fn back_buffer() -> &'static Mutex<Option<BackBuffer>> {
+    BACK_BUFFER.get_or_init(|| Mutex::new(None))
+}
+
+fn clear_back_buffer() {
+    if let Some(mutex) = BACK_BUFFER.get() {
+        if let Ok(mut guard) = mutex.lock() {
+            // Отпускаем bitmap (и память под него) при закрытии оверлея.
+            *guard = None;
+        }
+    }
+}
+
 fn paint_overlay(hwnd: HWND) {
     let dc = PaintDc::begin(hwnd);
     let hdc = dc.handle();
@@ -832,9 +867,57 @@ fn paint_overlay(hwnd: HWND) {
         let _ = GetClientRect(hwnd, &mut client);
     }
 
-    let (selection, hover_rect, pointer_down) = app::with_state(|s| {
-        (s.selection, s.hover_rect, s.pointer_down)
+    let width = client.right - client.left;
+    let height = client.bottom - client.top;
+    if width < 1 || height < 1 {
+        return;
+    }
+
+    let screen = ScreenDc::for_screen();
+    let mut guard = back_buffer().lock().unwrap();
+
+    let stale = guard
+        .as_ref()
+        .map_or(true, |buffer| buffer.width != width || buffer.height != height);
+    if stale {
+        *guard = BitmapDc::compatible(screen.handle(), width, height).map(|bitmap| BackBuffer {
+            width,
+            height,
+            bitmap,
+        });
+    }
+
+    match guard.as_ref() {
+        Some(buffer) => {
+            paint_scene(buffer.bitmap.handle(), &window_rect, &client);
+            unsafe {
+                let _ = BitBlt(
+                    hdc,
+                    0,
+                    0,
+                    width,
+                    height,
+                    buffer.bitmap.handle(),
+                    0,
+                    0,
+                    SRCCOPY,
+                );
+            }
+        }
+        // Не удалось создать буфер — рисуем напрямую, как раньше.
+        None => paint_scene(hdc, &window_rect, &client),
+    }
+}
+
+fn paint_scene(hdc: HDC, window_rect: &RECT, client: &RECT) {
+    let (selection, hover_rect, pointer_down, has_draft) = app::with_state(|s| {
+        (s.selection, s.hover_rect, s.pointer_down, s.draft.is_some())
     });
+
+    // Пока пользователь тянет новую рамку, панель не показываем: она бы
+    // прыгала под курсором. После отпускания — показываем.
+    let dragging_selection = pointer_down && !has_draft;
+    let editing = selection.active && !dragging_selection;
 
     let has_hover = hover_rect.right - hover_rect.left > 2
         && hover_rect.bottom - hover_rect.top > 2;
@@ -863,12 +946,12 @@ fn paint_overlay(hwnd: HWND) {
         // Аварийный фон, если снимок недоступен.
         let brush = GdiBrush::solid(PANEL_BG);
         unsafe {
-            let _ = FillRect(hdc, &client, brush.handle());
+            let _ = FillRect(hdc, client, brush.handle());
         }
     }
 
     let sel_local = if selection.active {
-        Some(screen_to_local(&app::selection_rect(&selection), &window_rect))
+        Some(screen_to_local(&app::selection_rect(&selection), window_rect))
     } else {
         None
     };
@@ -881,7 +964,7 @@ fn paint_overlay(hwnd: HWND) {
                 let _ = IntersectClipRect(hdc, local.left, local.top, local.right, local.bottom);
                 paint_annotations(
                     hdc,
-                    &window_rect,
+                    window_rect,
                     &s.annotations,
                     s.draft.as_ref(),
                     s.tool,
@@ -897,48 +980,55 @@ fn paint_overlay(hwnd: HWND) {
             local,
             selection_rect_width(&selection),
             selection_rect_height(&selection),
-            &client,
+            client,
             dpi,
         );
     } else if has_hover && !pointer_down {
-        let local = screen_to_local(&hover_rect, &window_rect);
+        let local = screen_to_local(&hover_rect, window_rect);
         draw_highlight(hdc, &local, dpi);
         draw_size_badge(
             hdc,
             &local,
             hover_rect.right - hover_rect.left,
             hover_rect.bottom - hover_rect.top,
-            &client,
+            client,
             dpi,
         );
     }
 
-    // Координаты курсора рядом с ним.
-    let coord_text = format!("{}, {}", cursor_screen.x, cursor_screen.y);
-    draw_coord_badge(hdc, cursor, &coord_text, &client, dpi);
+    // Координаты курсора — только во время протяжки, чтобы не гонять
+    // перерисовку на каждое движение мыши.
+    if pointer_down {
+        let coord_text = format!("{}, {}", cursor_screen.x, cursor_screen.y);
+        draw_coord_badge(hdc, cursor, &coord_text, client, dpi);
+    }
 
     // Подсказка сверху по центру монитора, на котором находится курсор.
-    let monitor = monitor_local_rect(cursor_screen, &window_rect);
-    let hint_size = measure_chip(hdc, HINT_TEXT, s(14, dpi), dpi);
+    let hint = if editing { HINT_EDIT } else { HINT_SELECT };
+    let monitor = monitor_local_rect(cursor_screen, window_rect);
+    let hint_size = measure_chip(hdc, hint, s(13, dpi), dpi);
     let hint_x = (monitor.left + monitor.right - hint_size.cx) / 2;
     let hint_y = monitor.top + s(14, dpi);
     draw_chip(
         hdc,
         hint_x,
         hint_y,
-        HINT_TEXT,
-        s(14, dpi),
+        hint,
+        s(13, dpi),
         TEXT_MAIN,
         PANEL_BG_BGRA,
-        200,
-        PANEL_BORDER,
+        180,
+        GLASS_BORDER,
         dpi,
     );
 
-    // Панель инструментов — последней, чтобы она была поверх всего.
-    let (active_tool, hot) = app::with_state(|s| (s.tool, s.hot));
-    let layout = toolbar_layout(hdc, &window_rect, cursor_screen, &selection, dpi);
-    draw_toolbar(hdc, &layout, active_tool, hot, dpi);
+    // Панель инструментов — последней, чтобы она была поверх всего,
+    // и только когда область уже выделена.
+    if editing {
+        let (active_tool, hot) = app::with_state(|s| (s.tool, s.hot));
+        let layout = toolbar_layout(hdc, window_rect, cursor_screen, &selection, dpi);
+        draw_toolbar(hdc, &layout, active_tool, hot, dpi);
+    }
 }
 
 fn selection_rect_width(selection: &Selection) -> i32 {
@@ -1129,11 +1219,14 @@ fn toolbar_layout(
     selection: &Selection,
     dpi: u32,
 ) -> ToolbarLayout {
-    let font = ui::make_font(s(13, dpi), 600);
-    let pad_x = s(12, dpi);
-    let pad = s(6, dpi);
-    let gap = s(4, dpi);
-    let btn_h = s(32, dpi);
+    let font = ui::make_font(s(12, dpi), 600);
+    let pad_x = s(9, dpi);
+    let pad = s(7, dpi);
+    let gap = s(5, dpi);
+    let btn_h = s(34, dpi);
+    let icon = s(15, dpi);
+    let icon_gap = s(5, dpi);
+    let sep_w = s(13, dpi);
 
     let mut specs: Vec<(&str, ToolbarHit)> = Tool::ALL
         .iter()
@@ -1144,11 +1237,11 @@ fn toolbar_layout(
     let mut widths = Vec::with_capacity(specs.len());
     let mut content_w = 0;
     for (label, _) in &specs {
-        let width = ui::measure_text(hdc, label, font).cx + pad_x * 2;
+        let width = ui::measure_text(hdc, label, font).cx + pad_x * 2 + icon + icon_gap;
         widths.push(width);
         content_w += width;
     }
-    content_w += gap * (specs.len() as i32 - 1);
+    content_w += gap * (specs.len() as i32 - 1) + sep_w;
 
     let panel_w = content_w + pad * 2;
     let panel_h = btn_h + pad * 2;
@@ -1195,8 +1288,20 @@ fn toolbar_layout(
     };
 
     let mut buttons = Vec::with_capacity(specs.len());
+    let mut separator = None;
     let mut x = left + pad;
     for ((_, hit), width) in specs.into_iter().zip(widths) {
+        if matches!(hit, ToolbarHit::Copy) {
+            let sep_x = x + gap / 2;
+            separator = Some(RECT {
+                left: sep_x,
+                top: top + pad + s(7, dpi),
+                right: sep_x + s(1, dpi).max(1),
+                bottom: top + pad + btn_h - s(7, dpi),
+            });
+            x += sep_w;
+        }
+
         let rect = RECT {
             left: x,
             top: top + pad,
@@ -1207,7 +1312,11 @@ fn toolbar_layout(
         x += width + gap;
     }
 
-    ToolbarLayout { panel, buttons }
+    ToolbarLayout {
+        panel,
+        buttons,
+        separator,
+    }
 }
 
 fn toolbar_hit(hwnd: HWND, cursor: POINT) -> Option<ToolbarHit> {
@@ -1219,7 +1328,13 @@ fn toolbar_hit(hwnd: HWND, cursor: POINT) -> Option<ToolbarHit> {
         }
     }
 
-    let selection = app::with_state(|s| s.selection);
+    // Панель существует только после выделения и не мешает тянуть новую рамку.
+    let (selection, dragging_selection) =
+        app::with_state(|s| (s.selection, s.pointer_down && s.draft.is_none()));
+    if !selection.active || dragging_selection {
+        return None;
+    }
+
     let dpi = dpi_at(cursor);
     let local = POINT {
         x: cursor.x - window.left,
@@ -1249,47 +1364,239 @@ fn hot_key(hit: Option<ToolbarHit>) -> i32 {
 }
 
 fn draw_toolbar(hdc: HDC, layout: &ToolbarLayout, active: Tool, hot: i32, dpi: u32) {
+    // Мягкая тень под парящей панелью.
+    let shadow = RECT {
+        left: layout.panel.left - s(4, dpi),
+        top: layout.panel.top + s(3, dpi),
+        right: layout.panel.right + s(4, dpi),
+        bottom: layout.panel.bottom + s(10, dpi),
+    };
+    ui::glass_glow(hdc, &shadow, s(20, dpi), [0, 0, 0, 255], 60);
+
+    // Сама панель: матовое стекло с бликом сверху.
     ui::frosted_round_rect(
         hdc,
         &layout.panel,
-        s(14, dpi),
+        s(16, dpi),
         PANEL_BG_BGRA,
-        220,
-        PANEL_BORDER,
-        34,
+        186,
+        GLASS_BORDER,
+        48,
     );
 
-    let font = ui::make_font(s(13, dpi), 600);
+    let font = ui::make_font(s(12, dpi), 600);
+    let icon_size = s(15, dpi);
+    let icon_gap = s(5, dpi);
+
+    if let Some(separator) = &layout.separator {
+        let brush = GdiBrush::solid(GLASS_BORDER);
+        unsafe {
+            let _ = FillRect(hdc, separator, brush.handle());
+        }
+    }
 
     for (index, (rect, hit)) in layout.buttons.iter().enumerate() {
         let is_copy = matches!(hit, ToolbarHit::Copy);
         let is_active = matches!(hit, ToolbarHit::Tool(tool) if *tool == active);
         let is_hot = hot == index as i32 + 1;
 
+        // Цветное свечение вокруг активной и главной кнопки.
+        if is_copy || is_active {
+            let glow = inflate(rect, s(2, dpi));
+            ui::glass_glow(
+                hdc,
+                &glow,
+                s(12, dpi),
+                ACCENT_BGRA,
+                if is_copy { 120 } else { 80 },
+            );
+        }
+
         let (tint, alpha, border, sheen_top, fg) = if is_copy {
-            (ACCENT_BGRA, 210, COPY_BORDER, 60, WHITE)
+            (ACCENT_BGRA, 215, COPY_BORDER, 70, WHITE)
         } else if is_active {
-            (ACCENT_BGRA, 120, ACCENT, 38, WHITE)
+            (ACCENT_BGRA, 120, ACCENT, 46, WHITE)
         } else if is_hot {
-            ([0xFF, 0xFF, 0xFF, 255], 40, ACCENT, 24, WHITE)
+            ([0xFF, 0xFF, 0xFF, 255], 30, ACCENT, 30, WHITE)
         } else {
-            ([0xFF, 0xFF, 0xFF, 255], 16, PANEL_BORDER, 14, TEXT_MAIN)
+            ([0xFF, 0xFF, 0xFF, 255], 14, GLASS_BORDER, 16, TEXT_MAIN)
         };
 
-        ui::frosted_round_rect(hdc, rect, s(9, dpi), tint, alpha, border, sheen_top);
+        // Кнопки лежат на уже размытой панели — повторное размытие не нужно.
+        ui::tint_round_rect(hdc, rect, s(10, dpi), tint, alpha, border, sheen_top);
 
         let label = match hit {
             ToolbarHit::Tool(tool) => tool.label(),
             ToolbarHit::Copy => "Копировать",
         };
         let text = ui::measure_text(hdc, label, font);
-        let x = rect.left + (rect.right - rect.left - text.cx) / 2;
-        let y = rect.top + (rect.bottom - rect.top - text.cy) / 2;
-        ui::draw_text(hdc, x, y, label, font, fg);
+        let content_w = icon_size + icon_gap + text.cx;
+        let start_x = rect.left + (rect.right - rect.left - content_w) / 2;
+        let mid_y = (rect.top + rect.bottom) / 2;
+
+        let icon_rect = RECT {
+            left: start_x,
+            top: mid_y - icon_size / 2,
+            right: start_x + icon_size,
+            bottom: mid_y - icon_size / 2 + icon_size,
+        };
+        draw_tool_icon(hdc, &icon_rect, *hit, fg, dpi);
+
+        let text_x = start_x + icon_size + icon_gap;
+        let text_y = mid_y - text.cy / 2;
+        ui::draw_text(hdc, text_x, text_y, label, font, fg);
     }
 
     unsafe {
         let _ = DeleteObject(font);
+    }
+}
+
+/// Иконки инструментов рисуются простыми GDI-примитивами: без внешних
+/// ресурсов, зато в цвет активной кнопки и с учётом DPI.
+fn draw_tool_icon(hdc: HDC, area: &RECT, hit: ToolbarHit, color: u32, dpi: u32) {
+    let x = area.left;
+    let y = area.top;
+    let w = area.right - area.left;
+    let h = area.bottom - area.top;
+    if w < 8 || h < 8 {
+        return;
+    }
+
+    let t = s(2, dpi).max(1);
+    let brush = GdiBrush::solid(color);
+
+    match hit {
+        ToolbarHit::Tool(Tool::Select) => {
+            // Уголки рамки выделения.
+            let len = (w / 2).max(t * 2);
+            let fill = |left, top, right, bottom| {
+                let rect = RECT {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                };
+                unsafe {
+                    let _ = FillRect(hdc, &rect, brush.handle());
+                }
+            };
+            fill(x, y, x + len, y + t);
+            fill(x, y, x + t, y + len);
+            fill(x + w - len, y, x + w, y + t);
+            fill(x + w - t, y, x + w, y + len);
+            fill(x, y + h - t, x + len, y + h);
+            fill(x, y + h - len, x + t, y + h);
+            fill(x + w - len, y + h - t, x + w, y + h);
+            fill(x + w - t, y + h - len, x + w, y + h);
+        }
+        ToolbarHit::Tool(Tool::Pixelate) => {
+            // Мозаика 3×3: чередование крупных и мелких квадратов.
+            let gap = s(1, dpi).max(1);
+            let cell = ((w - gap * 2) / 3).max(2);
+            for row in 0..3 {
+                for col in 0..3 {
+                    let left = x + col * (cell + gap);
+                    let top = y + row * (cell + gap);
+                    let shrink = if (row + col) % 2 == 0 { 0 } else { cell / 3 };
+                    let rect = RECT {
+                        left,
+                        top,
+                        right: (left + cell - shrink).min(x + w),
+                        bottom: (top + cell - shrink).min(y + h),
+                    };
+                    unsafe {
+                        let _ = FillRect(hdc, &rect, brush.handle());
+                    }
+                }
+            }
+        }
+        ToolbarHit::Tool(Tool::Blur) => {
+            // Концентрические окружности — «мягкий фокус».
+            let pen = GdiPen::solid(1, color);
+            unsafe {
+                let old_pen = SelectObject(hdc, pen.handle());
+                let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                let _ = Ellipse(hdc, x, y, x + w, y + h);
+                let inset = s(3, dpi).max(2);
+                if w - inset * 2 > 2 && h - inset * 2 > 2 {
+                    let _ = Ellipse(hdc, x + inset, y + inset, x + w - inset, y + h - inset);
+                }
+                SelectObject(hdc, old_brush);
+                SelectObject(hdc, old_pen);
+            }
+            let dot = s(3, dpi).max(2);
+            let rect = RECT {
+                left: x + (w - dot) / 2,
+                top: y + (h - dot) / 2,
+                right: x + (w - dot) / 2 + dot,
+                bottom: y + (h - dot) / 2 + dot,
+            };
+            unsafe {
+                let _ = FillRect(hdc, &rect, brush.handle());
+            }
+        }
+        ToolbarHit::Tool(Tool::Arrow) => {
+            let from = POINT {
+                x: x + s(1, dpi),
+                y: y + h - s(1, dpi),
+            };
+            let to = POINT {
+                x: x + w - s(1, dpi),
+                y: y + s(1, dpi),
+            };
+            paint_shape(hdc, Tool::Arrow, from, to, t, color);
+        }
+        ToolbarHit::Tool(Tool::Line) => {
+            let from = POINT {
+                x: x + s(2, dpi),
+                y: y + h - s(2, dpi),
+            };
+            let to = POINT {
+                x: x + w - s(2, dpi),
+                y: y + s(2, dpi),
+            };
+            paint_shape(hdc, Tool::Line, from, to, t, color);
+        }
+        ToolbarHit::Tool(Tool::Rect) => {
+            let rect = RECT {
+                left: x,
+                top: y + s(1, dpi),
+                right: x + w,
+                bottom: y + h - s(1, dpi),
+            };
+            ui::stroke_rect(hdc, &rect, t, color);
+        }
+        ToolbarHit::Tool(Tool::Ellipse) => {
+            let pen = GdiPen::solid(t, color);
+            unsafe {
+                let old_pen = SelectObject(hdc, pen.handle());
+                let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                let _ = Ellipse(hdc, x, y + s(1, dpi), x + w, y + h - s(1, dpi));
+                SelectObject(hdc, old_brush);
+                SelectObject(hdc, old_pen);
+            }
+        }
+        ToolbarHit::Copy => {
+            // Два листа: задний — контуром, передний — заливкой.
+            let offset = s(3, dpi).max(2);
+            let back = RECT {
+                left: x + offset,
+                top: y,
+                right: x + w,
+                bottom: y + h - offset,
+            };
+            ui::stroke_rect(hdc, &back, s(1, dpi).max(1), color);
+            let front = RECT {
+                left: x,
+                top: y + offset,
+                right: x + w - offset,
+                bottom: y + h,
+            };
+            unsafe {
+                let _ = FillRect(hdc, &front, brush.handle());
+            }
+        }
     }
 }
 
@@ -1306,8 +1613,76 @@ fn draw_highlight(hdc: HDC, local: &RECT, dpi: u32) {
         right: local.right + 1,
         bottom: local.bottom + 1,
     };
-    ui::stroke_rect(hdc, &outer, 1, WHITE);
+    ui::stroke_rect(hdc, &outer, 1, GLASS_BORDER);
     ui::stroke_rect(hdc, local, s(2, dpi).max(2), ACCENT);
+    draw_corner_ticks(hdc, local, dpi);
+}
+
+/// Белые «уголки» поверх рамки — как ручки выделения.
+fn draw_corner_ticks(hdc: HDC, local: &RECT, dpi: u32) {
+    if local.right - local.left < s(24, dpi) || local.bottom - local.top < s(24, dpi) {
+        return;
+    }
+
+    let t = s(3, dpi).max(2);
+    let len = s(16, dpi).max(6);
+    let brush = GdiBrush::solid(WHITE);
+    let strips = [
+        RECT {
+            left: local.left,
+            top: local.top,
+            right: local.left + len,
+            bottom: local.top + t,
+        },
+        RECT {
+            left: local.left,
+            top: local.top,
+            right: local.left + t,
+            bottom: local.top + len,
+        },
+        RECT {
+            left: local.right - len,
+            top: local.top,
+            right: local.right,
+            bottom: local.top + t,
+        },
+        RECT {
+            left: local.right - t,
+            top: local.top,
+            right: local.right,
+            bottom: local.top + len,
+        },
+        RECT {
+            left: local.left,
+            top: local.bottom - t,
+            right: local.left + len,
+            bottom: local.bottom,
+        },
+        RECT {
+            left: local.left,
+            top: local.bottom - len,
+            right: local.left + t,
+            bottom: local.bottom,
+        },
+        RECT {
+            left: local.right - len,
+            top: local.bottom - t,
+            right: local.right,
+            bottom: local.bottom,
+        },
+        RECT {
+            left: local.right - t,
+            top: local.bottom - len,
+            right: local.right,
+            bottom: local.bottom,
+        },
+    ];
+
+    unsafe {
+        for strip in &strips {
+            let _ = FillRect(hdc, strip, brush.handle());
+        }
+    }
 }
 
 fn draw_size_badge(
@@ -1408,6 +1783,16 @@ fn point_in_rect(point: POINT, rect: &RECT) -> bool {
         && point.x < rect.right
         && point.y >= rect.top
         && point.y < rect.bottom
+}
+
+/// Увеличить прямоугольник на `by` со всех сторон.
+fn inflate(rect: &RECT, by: i32) -> RECT {
+    RECT {
+        left: rect.left - by,
+        top: rect.top - by,
+        right: rect.right + by,
+        bottom: rect.bottom + by,
+    }
 }
 
 fn clamp_point(point: POINT, rect: &RECT) -> POINT {

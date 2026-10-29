@@ -145,13 +145,67 @@ pub fn frosted_round_rect(
     border: u32,
     sheen_top: u8,
 ) {
+    let blurred = sample_blurred(hdc, rect);
+    glass_layers(
+        hdc,
+        rect,
+        radius,
+        tint,
+        alpha,
+        Some(border),
+        sheen_top,
+        blurred.as_ref(),
+    );
+}
+
+/// Полупрозрачное стекло без повторного размытия: для кнопок и плашек,
+/// которые лежат на уже размытой панели. Дешевле, чем `frosted_round_rect`.
+#[allow(clippy::too_many_arguments)]
+pub fn tint_round_rect(
+    hdc: HDC,
+    rect: &RECT,
+    radius: i32,
+    tint: [u8; 4],
+    alpha: u8,
+    border: u32,
+    sheen_top: u8,
+) {
+    glass_layers(
+        hdc,
+        rect,
+        radius,
+        tint,
+        alpha,
+        Some(border),
+        sheen_top,
+        None,
+    );
+}
+
+/// Мягкое цветное свечение без рамки — подсветка активной кнопки.
+pub fn glass_glow(hdc: HDC, rect: &RECT, radius: i32, tint: [u8; 4], alpha: u8) {
+    glass_layers(hdc, rect, radius, tint, alpha, None, 0, None);
+}
+
+/// Общая отрисовка стеклянного слоя: размытие (если есть) → тонировка →
+/// блик → рамка, всё обрезано по скруглённому прямоугольнику.
+#[allow(clippy::too_many_arguments)]
+fn glass_layers(
+    hdc: HDC,
+    rect: &RECT,
+    radius: i32,
+    tint: [u8; 4],
+    alpha: u8,
+    border: Option<u32>,
+    sheen_top: u8,
+    blurred: Option<&BitmapDc>,
+) {
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
     if width < 4 || height < 4 {
         return;
     }
 
-    let blurred = sample_blurred(hdc, rect);
     let blend = BLENDFUNCTION {
         BlendOp: AC_SRC_OVER as u8,
         BlendFlags: 0,
@@ -171,7 +225,7 @@ pub fn frosted_round_rect(
         );
         let _ = SelectClipRgn(hdc, region);
 
-        if let Some(blurred) = &blurred {
+        if let Some(blurred) = blurred {
             let _ = AlphaBlend(
                 hdc,
                 rect.left,
@@ -207,21 +261,26 @@ pub fn frosted_round_rect(
             );
         }
 
-        sheen(hdc, rect, sheen_top, 0);
-        let pen = GdiPen::solid(1, border);
-        let old_pen = SelectObject(hdc, pen.handle());
-        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        let _ = RoundRect(
-            hdc,
-            rect.left,
-            rect.top,
-            rect.right,
-            rect.bottom,
-            radius * 2,
-            radius * 2,
-        );
-        SelectObject(hdc, old_brush);
-        SelectObject(hdc, old_pen);
+        if sheen_top > 0 {
+            sheen(hdc, rect, sheen_top, 0);
+        }
+
+        if let Some(border) = border {
+            let pen = GdiPen::solid(1, border);
+            let old_pen = SelectObject(hdc, pen.handle());
+            let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            let _ = RoundRect(
+                hdc,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom,
+                radius * 2,
+                radius * 2,
+            );
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+        }
 
         let _ = RestoreDC(hdc, saved);
         let _ = DeleteObject(region);
