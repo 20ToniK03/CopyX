@@ -4,6 +4,8 @@ use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use copyx_core::CaptureState;
 
+use crate::render::BitmapDc;
+
 static APP_STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
 
 pub struct AppState {
@@ -15,6 +17,93 @@ pub struct AppState {
     pub hover_window: HWND,
     pub hover_rect: RECT,
     pub capture_state: CaptureState,
+    /// Активный инструмент редактора.
+    pub tool: Tool,
+    /// Готовые аннотации в координатах экрана.
+    pub annotations: Vec<Annotation>,
+    /// Аннотация, которую пользователь рисует прямо сейчас.
+    pub draft: Option<Draft>,
+    /// Подсвеченная кнопка панели инструментов (0 — нет, 1–7 — инструмент, 8 — «Копировать»).
+    pub hot: i32,
+}
+
+/// Инструменты редактора, доступные после нажатия PrtSc.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tool {
+    Select,
+    Pixelate,
+    Blur,
+    Arrow,
+    Line,
+    Rect,
+    Ellipse,
+}
+
+impl Tool {
+    pub const ALL: [Tool; 7] = [
+        Tool::Select,
+        Tool::Pixelate,
+        Tool::Blur,
+        Tool::Arrow,
+        Tool::Line,
+        Tool::Rect,
+        Tool::Ellipse,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tool::Select => "Область",
+            Tool::Pixelate => "Пиксели",
+            Tool::Blur => "Размытие",
+            Tool::Arrow => "Стрелка",
+            Tool::Line => "Линия",
+            Tool::Rect => "Квадрат",
+            Tool::Ellipse => "Круг",
+        }
+    }
+
+    pub fn is_effect(self) -> bool {
+        matches!(self, Tool::Pixelate | Tool::Blur)
+    }
+
+    pub fn is_shape(self) -> bool {
+        matches!(self, Tool::Arrow | Tool::Line | Tool::Rect | Tool::Ellipse)
+    }
+}
+
+/// Нарисованная аннотация. Для эффектов заранее готовится bitmap,
+/// чтобы превью не пересчитывалось на каждой перерисовке.
+pub struct Annotation {
+    pub tool: Tool,
+    pub start: POINT,
+    pub end: POINT,
+    /// Толщина линии, уже масштабированная под DPI.
+    pub width: i32,
+    pub effect: Option<BitmapDc>,
+}
+
+/// Черновик аннотации, пока пользователь тянет мышь.
+pub struct Draft {
+    pub start: POINT,
+    pub end: POINT,
+    /// Живое превью эффекта: обновляется не чаще, чем раз в несколько кадров.
+    pub preview: Option<BitmapDc>,
+    /// Область, для которой построено превью.
+    pub preview_rect: Option<RECT>,
+    /// Когда превью пересчитывалось в последний раз.
+    pub preview_at: Option<std::time::Instant>,
+}
+
+impl Draft {
+    pub fn new(start: POINT) -> Self {
+        Self {
+            start,
+            end: start,
+            preview: None,
+            preview_rect: None,
+            preview_at: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +134,10 @@ impl Default for AppState {
             hover_window: HWND(0),
             hover_rect: RECT::default(),
             capture_state: CaptureState::Idle,
+            tool: Tool::Select,
+            annotations: Vec::new(),
+            draft: None,
+            hot: 0,
         }
     }
 }

@@ -186,6 +186,53 @@ impl Snapshot {
         Ok(image)
     }
 
+    /// Пикселизированная копия области (готовый bitmap для BitBlt).
+    pub fn pixelate_bitmap(&self, screen_rect: &RECT, block: i32) -> Option<BitmapDc> {
+        self.effect_bitmap(screen_rect, |pixels, width, height| {
+            pixelate_bgra(pixels, width, height, block.max(2) as usize);
+        })
+    }
+
+    /// Размытая копия области (готовый bitmap для BitBlt).
+    pub fn blur_bitmap(&self, screen_rect: &RECT, radius: i32) -> Option<BitmapDc> {
+        self.effect_bitmap(screen_rect, |pixels, width, height| {
+            crate::ui::blur_bgra(
+                pixels,
+                width,
+                height,
+                radius.max(1) as usize,
+            );
+        })
+    }
+
+    /// Снять область с яркой копии экрана, прогнать через фильтр и вернуть bitmap.
+    fn effect_bitmap(
+        &self,
+        screen_rect: &RECT,
+        filter: impl FnOnce(&mut [u8], usize, usize),
+    ) -> Option<BitmapDc> {
+        // Эффект должен совпадать с итоговым снимком, поэтому обрезанные
+        // (частично за экраном) области не поддерживаем.
+        let rect = self.clip(screen_rect)?;
+        if !same_rect(&rect, screen_rect) {
+            return None;
+        }
+
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        let mut image = capture::grab_region_bgra(
+            self.bright.handle(),
+            rect.left - self.origin.x,
+            rect.top - self.origin.y,
+            width,
+            height,
+        )
+        .ok()?;
+
+        filter(&mut image.pixels, width as usize, height as usize);
+        BitmapDc::from_bgra(self.bright.handle(), width, height, &image.pixels)
+    }
+
     fn clip(&self, rect: &RECT) -> Option<RECT> {
         let left = rect.left.max(self.origin.x);
         let top = rect.top.max(self.origin.y);
@@ -201,4 +248,58 @@ impl Snapshot {
             bottom,
         })
     }
+}
+
+/// Усреднить цвета в квадратных блоках — «мозаика» без изменения размера.
+pub fn pixelate_bgra(pixels: &mut [u8], width: usize, height: usize, block: usize) {
+    if width == 0
+        || height == 0
+        || block < 2
+        || pixels.len() < width * height * 4
+    {
+        return;
+    }
+
+    let mut y = 0;
+    while y < height {
+        let bottom = (y + block).min(height);
+        let mut x = 0;
+        while x < width {
+            let right = (x + block).min(width);
+            let count = ((right - x) * (bottom - y)) as u32;
+            let mut acc = [0u32; 4];
+
+            for row in y..bottom {
+                let offset = row * width * 4;
+                for col in x..right {
+                    let px = offset + col * 4;
+                    for channel in 0..4 {
+                        acc[channel] += pixels[px + channel] as u32;
+                    }
+                }
+            }
+
+            let avg = [
+                (acc[0] / count) as u8,
+                (acc[1] / count) as u8,
+                (acc[2] / count) as u8,
+                (acc[3] / count) as u8,
+            ];
+
+            for row in y..bottom {
+                let offset = row * width * 4;
+                for col in x..right {
+                    let px = offset + col * 4;
+                    pixels[px..px + 4].copy_from_slice(&avg);
+                }
+            }
+
+            x = right;
+        }
+        y = bottom;
+    }
+}
+
+fn same_rect(a: &RECT, b: &RECT) -> bool {
+    a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
 }

@@ -1,14 +1,19 @@
-//! Fullscreen overlay window for region/window selection.
+//! Fullscreen overlay: region/window selection **and** annotation editor.
 //!
 //! Visual model (ShareX-like):
 //! * the screen is captured **before** the overlay appears;
 //! * the frozen frame is painted back dimmed;
-//! * the hovered window / dragged region is painted at full brightness;
-//! * hints and coordinate/size badges are drawn on top as frosted glass.
+//! * the selected region is painted at full brightness;
+//! * annotations (pixelate, blur, arrows, lines, rectangles, ellipses) are drawn
+//!   on top of the frozen frame;
+//! * tools, hints and coordinate/size badges are frosted glass panels.
 //!
-//! This keeps the screen readable instead of blurring it with acrylic.
+//! The selection stays after the mouse is released, so the user can apply as
+//! many annotations as needed. Enter or «Копировать» finishes the capture,
+//! Esc / right click cancels it.
 
-use crate::app::{self, Selection};
+use crate::app::{self, Annotation, Draft, Selection, Tool};
+use crate::capture::{self, CapturedImage};
 use crate::clipboard;
 use crate::render::*;
 use crate::snapshot;
@@ -16,6 +21,7 @@ use crate::toast;
 use crate::ui;
 use copyx_core::CaptureState;
 use std::mem::size_of;
+use std::time::{Duration, Instant};
 
 use windows::core::w;
 use windows::Win32::Foundation::{
@@ -25,8 +31,9 @@ use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::Graphics::Gdi::{
-    DeleteObject, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, UpdateWindow, HDC,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    BitBlt, DeleteObject, Ellipse, FillRect, GetMonitorInfoW, GetStockObject, IntersectClipRect,
+    InvalidateRect, LineTo, MonitorFromPoint, MoveToEx, Polygon, Rectangle, RestoreDC, SaveDC,
+    SelectObject, UpdateWindow, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, SRCCOPY,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus};
@@ -34,16 +41,31 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 // --- Палитра (COLORREF = 0x00BBGGRR) ---
 const ACCENT: u32 = 0x00FFB86B; // RGB(107, 184, 255) — мягкий голубой
+const ACCENT_BGRA: [u8; 4] = [0xFF, 0xB8, 0x6B, 255];
 const PANEL_BG: u32 = 0x00221612; // тёмное "стекло" RGB(18, 22, 34)
 const PANEL_BG_BGRA: [u8; 4] = [0x12, 0x16, 0x22, 255]; // тот же цвет в BGRA
 const SIZE_BG_BGRA: [u8; 4] = [0x6E, 0x34, 0x18, 255]; // тёмно-синее стекло для размера
 const PANEL_BORDER: u32 = 0x00785A46; // RGB(70, 90, 120)
+const COPY_BORDER: u32 = 0x00FFE6D2; // светлая кромка акцентной кнопки
 const TEXT_MAIN: u32 = 0x00FFFFFF;
 const TEXT_MUTED: u32 = 0x00D8C8B4; // RGB(180, 200, 216)
 const WHITE: u32 = 0x00FFFFFF;
+const ANNOTATION: u32 = 0x004D5AFF; // RGB(255, 90, 77) — тёплый красный
 
 const HINT_TEXT: &str =
-    "ЛКМ — область · клик — окно · Ctrl+A — весь экран · Esc/ПКМ — отмена";
+    "ЛКМ — область · 1–7 — инструменты · Enter — копировать · Esc/ПКМ — отмена";
+
+/// Кнопки панели инструментов.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolbarHit {
+    Tool(Tool),
+    Copy,
+}
+
+struct ToolbarLayout {
+    panel: RECT,
+    buttons: Vec<(RECT, ToolbarHit)>,
+}
 
 pub fn show(instance: HINSTANCE) {
     let needs_create = app::with_state(|s| s.overlay_hwnd.0 == 0);
@@ -77,6 +99,11 @@ pub fn show(instance: HINSTANCE) {
         s.hover_window = HWND(0);
         s.hover_rect = RECT::default();
         s.capture_state = CaptureState::OverlayShown;
+        // Каждый новый снимок начинается с выделения области.
+        s.tool = Tool::Select;
+        s.annotations.clear();
+        s.draft = None;
+        s.hot = 0;
     });
 
     unsafe {
@@ -105,6 +132,10 @@ pub fn hide() {
         s.pointer_down = false;
         s.hover_window = HWND(0);
         s.hover_rect = RECT::default();
+        s.tool = Tool::Select;
+        s.annotations.clear();
+        s.draft = None;
+        s.hot = 0;
         s.overlay_hwnd
     });
     if hwnd.0 != 0 {
@@ -270,17 +301,32 @@ unsafe extern "system" fn overlay_proc(
 ) -> LRESULT {
     match msg {
         WM_KEYDOWN => {
-            match wparam.0 as u32 {
-                // Esc — отмена.
+            let key = wparam.0 as u32;
+            let ctrl = ctrl_down();
+            match key {
+                // Esc — отмена всего снимка.
                 0x1B => hide(),
-                // Enter — захватить текущее выделение / окно под курсором.
+                // Enter — скопировать текущее выделение (или окно под курсором).
                 0x0D => {
                     if let Some(target) = current_target() {
                         finish_capture(target);
                     }
                 }
-                // Ctrl+A — весь экран.
-                0x41 if ctrl_down() => finish_capture(virtual_screen()),
+                // Ctrl+A — выделить весь экран, но не копировать сразу.
+                0x41 if ctrl => select_all(hwnd),
+                // Ctrl+C — то же, что Enter: скопировать выделение.
+                0x43 if ctrl => {
+                    if let Some(target) = current_target() {
+                        finish_capture(target);
+                    }
+                }
+                // Ctrl+Z — отменить последнюю аннотацию.
+                0x5A if ctrl => undo(hwnd),
+                // 1–7 — выбор инструмента (Ctrl+1…7 тоже работает).
+                0x31..=0x37 => {
+                    let tool = Tool::ALL[(key - 0x31) as usize];
+                    set_tool(hwnd, tool);
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -291,14 +337,55 @@ unsafe extern "system" fn overlay_proc(
             LRESULT(0)
         }
 
+        WM_SETCURSOR => {
+            let mut cursor = POINT::default();
+            let _ = GetCursorPos(&mut cursor);
+            let arrow = toolbar_hit(hwnd, cursor).is_some();
+            let shape = if arrow { IDC_ARROW } else { IDC_CROSS };
+            if let Ok(handle) = LoadCursorW(None, shape) {
+                SetCursor(handle);
+            }
+            LRESULT(1)
+        }
+
         WM_LBUTTONDOWN => {
             let mut cursor = POINT::default();
             let _ = GetCursorPos(&mut cursor);
 
-            // Запоминаем окно под курсором: если пользователь просто кликнет,
-            // захватим именно его.
-            let (candidate, bounds) = window_at_point(cursor, hwnd);
+            // Клик по панели инструментов не начинает выделение.
+            if let Some(hit) = toolbar_hit(hwnd, cursor) {
+                match hit {
+                    ToolbarHit::Tool(tool) => set_tool(hwnd, tool),
+                    ToolbarHit::Copy => {
+                        if let Some(target) = current_target() {
+                            finish_capture(target);
+                        }
+                    }
+                }
+                return LRESULT(0);
+            }
 
+            let (selection, tool) = app::with_state(|s| (s.selection, s.tool));
+            let sel_rect = app::selection_rect(&selection);
+            let inside_selection = selection.active
+                && sel_rect.right - sel_rect.left > 4
+                && sel_rect.bottom - sel_rect.top > 4
+                && point_in_rect(cursor, &sel_rect);
+
+            if inside_selection && tool != Tool::Select {
+                // Рисуем аннотацию внутри уже выбранной области.
+                let start = clamp_point(cursor, &sel_rect);
+                app::with_state(|s| {
+                    s.pointer_down = true;
+                    s.capture_state = CaptureState::Selecting;
+                    s.draft = Some(Draft::new(start));
+                });
+                let _ = InvalidateRect(hwnd, None, false);
+                return LRESULT(0);
+            }
+
+            // Новое выделение: старые аннотации к нему уже не относятся.
+            let (candidate, bounds) = window_at_point(cursor, hwnd);
             app::with_state(|s| {
                 s.pointer_down = true;
                 s.selection.active = false;
@@ -306,6 +393,8 @@ unsafe extern "system" fn overlay_proc(
                 s.selection.current = cursor;
                 s.hover_window = candidate;
                 s.hover_rect = bounds;
+                s.annotations.clear();
+                s.draft = None;
                 s.capture_state = CaptureState::OverlayShown;
             });
             let _ = InvalidateRect(hwnd, None, false);
@@ -315,30 +404,104 @@ unsafe extern "system" fn overlay_proc(
         WM_MOUSEMOVE => {
             let mut cursor = POINT::default();
             let _ = GetCursorPos(&mut cursor);
+            let dpi = dpi_at(cursor);
 
-            let pointer_down = app::with_state(|s| s.pointer_down);
+            let (pointer_down, has_draft, selection) =
+                app::with_state(|s| (s.pointer_down, s.draft.is_some(), s.selection));
 
             if pointer_down {
-                app::with_state(|s| {
-                    s.selection.current = cursor;
-                    let dx = (cursor.x - s.selection.start.x).abs();
-                    let dy = (cursor.y - s.selection.start.y).abs();
-                    if !s.selection.active && (dx > 4 || dy > 4) {
-                        s.selection.active = true;
-                        s.capture_state = CaptureState::Selecting;
+                if has_draft {
+                    // Тянем аннотацию внутри выделения.
+                    let sel_rect = app::selection_rect(&selection);
+                    let tool = app::with_state(|s| s.tool);
+                    let (preview_request, moved) = app::with_state(|s| {
+                        let end = clamp_point(cursor, &sel_rect);
+                        let mut request = None;
+                        let mut moved = false;
+
+                        if let Some(draft) = s.draft.as_mut() {
+                            if draft.end.x != end.x || draft.end.y != end.y {
+                                draft.end = end;
+                                moved = true;
+                            }
+
+                            if moved && tool.is_effect() {
+                                let rect = normalized(draft.start, draft.end);
+                                let area = (rect.right - rect.left) as i64
+                                    * (rect.bottom - rect.top) as i64;
+                                let due = draft.preview_at.map_or(true, |at| {
+                                    at.elapsed() >= Duration::from_millis(40)
+                                });
+                                if due
+                                    && rect.right - rect.left > 2
+                                    && rect.bottom - rect.top > 2
+                                    // Очень большие области не превьюим: размытие
+                                    // такого размера заметно подвесило бы оверлей.
+                                    && area <= 900_000
+                                {
+                                    draft.preview_at = Some(Instant::now());
+                                    request = Some((tool, rect));
+                                }
+                            }
+                        }
+
+                        (request, moved)
+                    });
+
+                    if let Some((tool, rect)) = preview_request {
+                        let preview = make_effect(tool, &rect, dpi);
+                        app::with_state(|s| {
+                            if let Some(draft) = s.draft.as_mut() {
+                                draft.preview = preview;
+                                draft.preview_rect = Some(rect);
+                            }
+                        });
+                    }
+
+                    if moved || preview_request.is_some() {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                } else {
+                    // Тянем новое выделение.
+                    app::with_state(|s| {
+                        s.selection.current = cursor;
+                        let dx = (cursor.x - s.selection.start.x).abs();
+                        let dy = (cursor.y - s.selection.start.y).abs();
+                        if !s.selection.active && (dx > 4 || dy > 4) {
+                            s.selection.active = true;
+                            s.capture_state = CaptureState::Selecting;
+                        }
+                    });
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            } else {
+                // Подсветка кнопок панели и окна под курсором.
+                let hot = hot_key(toolbar_hit(hwnd, cursor));
+                let hot_changed = app::with_state(|s| {
+                    if s.hot != hot {
+                        s.hot = hot;
+                        true
+                    } else {
+                        false
                     }
                 });
-                let _ = InvalidateRect(hwnd, None, false);
-            } else {
-                let (candidate, bounds) = window_at_point(cursor, hwnd);
-                let changed = app::with_state(|s| {
-                    let changed = s.hover_window != candidate || !same_rect(&s.hover_rect, &bounds);
-                    s.hover_window = candidate;
-                    s.hover_rect = bounds;
-                    changed
-                });
-                if changed {
-                    let _ = InvalidateRect(hwnd, None, false);
+
+                if selection.active {
+                    if hot_changed {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                } else {
+                    let (candidate, bounds) = window_at_point(cursor, hwnd);
+                    let hover_changed = app::with_state(|s| {
+                        let changed = s.hover_window != candidate
+                            || !same_rect(&s.hover_rect, &bounds);
+                        s.hover_window = candidate;
+                        s.hover_rect = bounds;
+                        changed
+                    });
+                    if hover_changed || hot_changed {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
                 }
             }
 
@@ -348,35 +511,104 @@ unsafe extern "system" fn overlay_proc(
         WM_LBUTTONUP => {
             let mut cursor = POINT::default();
             let _ = GetCursorPos(&mut cursor);
+            let dpi = dpi_at(cursor);
 
-            let (was_selecting, sel_rect, hover_rect) = app::with_state(|s| {
+            let (pointer_down, has_draft) =
+                app::with_state(|s| (s.pointer_down, s.draft.is_some()));
+            if !pointer_down {
+                return LRESULT(0);
+            }
+
+            if has_draft {
+                let (mut draft, tool, sel_rect) = app::with_state(|s| {
+                    s.pointer_down = false;
+                    s.capture_state = CaptureState::OverlayShown;
+                    (s.draft.take(), s.tool, app::selection_rect(&s.selection))
+                });
+
+                if let Some(draft_ref) = draft.as_mut() {
+                    // Последний WM_MOUSEMOVE мог не успеть за курсором —
+                    // фиксируем точный конец перетаскивания здесь.
+                    draft_ref.end = clamp_point(cursor, &sel_rect);
+                }
+
+                if let Some(draft) = draft {
+                    let rect = normalized(draft.start, draft.end);
+                    let width = rect.right - rect.left;
+                    let height = rect.bottom - rect.top;
+                    let big_enough = if matches!(tool, Tool::Line | Tool::Arrow) {
+                        // Линия/стрелка может быть строго горизонтальной.
+                        width > 2 || height > 2
+                    } else {
+                        width > 2 && height > 2
+                    };
+
+                    if big_enough && tool.is_effect() {
+                        if let Some(effect) = make_effect(tool, &rect, dpi) {
+                            app::with_state(|state| {
+                                state.annotations.push(Annotation {
+                                    tool,
+                                    start: POINT {
+                                        x: rect.left,
+                                        y: rect.top,
+                                    },
+                                    end: POINT {
+                                        x: rect.right,
+                                        y: rect.bottom,
+                                    },
+                                    width: 0,
+                                    effect: Some(effect),
+                                });
+                            });
+                        }
+                    } else if big_enough && tool.is_shape() {
+                        let stroke = s(3, dpi).max(2);
+                        app::with_state(|state| {
+                            state.annotations.push(Annotation {
+                                tool,
+                                start: draft.start,
+                                end: draft.end,
+                                width: stroke,
+                                effect: None,
+                            });
+                        });
+                    }
+                }
+
+                let _ = InvalidateRect(hwnd, None, false);
+                return LRESULT(0);
+            }
+
+            // Отпустили кнопку после выделения области: не копируем сразу,
+            // а оставляем рамку — пользователь может добавить аннотации.
+            let (was_selecting, hover_rect) = app::with_state(|s| {
                 s.pointer_down = false;
                 s.selection.current = cursor;
-                let selecting = s.selection.active;
-                let sr = app::selection_rect(&s.selection);
-                (selecting, sr, s.hover_rect)
+                s.capture_state = CaptureState::OverlayShown;
+                (s.selection.active, s.hover_rect)
             });
 
-            let target = if was_selecting
-                && (sel_rect.right - sel_rect.left) > 4
-                && (sel_rect.bottom - sel_rect.top) > 4
-            {
-                Some(sel_rect)
-            } else if hover_rect.right - hover_rect.left > 2
-                && hover_rect.bottom - hover_rect.top > 2
-            {
-                Some(hover_rect)
-            } else {
-                None
-            };
+            let hover_valid = hover_rect.right - hover_rect.left > 2
+                && hover_rect.bottom - hover_rect.top > 2;
 
-            let Some(target) = target else {
-                hide();
-                return LRESULT(0);
-            };
+            if !was_selecting && hover_valid {
+                // Короткий клик — выделяем окно под курсором.
+                app::with_state(|s| {
+                    s.selection.active = true;
+                    s.selection.start = POINT {
+                        x: hover_rect.left,
+                        y: hover_rect.top,
+                    };
+                    s.selection.current = POINT {
+                        x: hover_rect.right,
+                        y: hover_rect.bottom,
+                    };
+                });
+            } else if !was_selecting {
+                app::with_state(|s| s.selection.active = false);
+            }
 
-            finish_capture(target);
-
+            let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
 
@@ -414,6 +646,55 @@ fn virtual_screen() -> RECT {
     }
 }
 
+fn select_all(hwnd: HWND) {
+    if app::with_state(|s| s.pointer_down) {
+        return;
+    }
+    let rect = virtual_screen();
+    app::with_state(|s| {
+        s.selection.active = true;
+        s.selection.start = POINT {
+            x: rect.left,
+            y: rect.top,
+        };
+        s.selection.current = POINT {
+            x: rect.right,
+            y: rect.bottom,
+        };
+        s.annotations.clear();
+        s.draft = None;
+        s.capture_state = CaptureState::Selecting;
+    });
+    let _ = unsafe { InvalidateRect(hwnd, None, false) };
+}
+
+fn undo(hwnd: HWND) {
+    let changed = app::with_state(|s| {
+        if s.draft.is_some() || s.pointer_down {
+            return false;
+        }
+        s.annotations.pop().is_some()
+    });
+    if changed {
+        let _ = unsafe { InvalidateRect(hwnd, None, false) };
+    }
+}
+
+fn set_tool(hwnd: HWND, tool: Tool) {
+    let changed = app::with_state(|s| {
+        if s.pointer_down {
+            return false;
+        }
+        let changed = s.tool != tool;
+        s.tool = tool;
+        s.hot = 0;
+        changed
+    });
+    if changed {
+        let _ = unsafe { InvalidateRect(hwnd, None, false) };
+    }
+}
+
 /// Что захватывать по Enter: активное выделение, иначе окно под курсором.
 fn current_target() -> Option<RECT> {
     app::with_state(|s| {
@@ -432,8 +713,12 @@ fn current_target() -> Option<RECT> {
     })
 }
 
-/// Вырезать область из замороженного кадра, скопировать в буфер и показать тост.
+/// Вырезать область из замороженного кадра, наложить аннотации,
+/// скопировать в буфер и показать тост.
 fn finish_capture(target: RECT) {
+    // Аннотации забираем до hide(): hide очищает состояние.
+    let annotations = app::with_state(|s| std::mem::take(&mut s.annotations));
+
     // Режем ровно то, что видел пользователь: без повторного захвата экрана
     // и без мигания оверлея.
     let cropped = snapshot::with_current(|snap| snap.crop(&target));
@@ -442,12 +727,94 @@ fn finish_capture(target: RECT) {
 
     match cropped {
         Some(Ok(img)) => {
+            let composed = compose(&img, &target, &annotations);
+            let img = composed.unwrap_or(img);
             let copied = clipboard::copy_to_clipboard(&img).is_ok();
             toast::show(img, copied);
         }
         Some(Err(e)) => show_error(&format!("Ошибка захвата:\n{e}")),
         None => show_error("Снимок экрана потерян, попробуйте ещё раз."),
     }
+}
+
+/// Наложить эффекты и фигуры на итоговый снимок.
+fn compose(
+    base: &CapturedImage,
+    target: &RECT,
+    annotations: &[Annotation],
+) -> Option<CapturedImage> {
+    if annotations.is_empty() {
+        return None;
+    }
+
+    let width = base.width as i32;
+    let height = base.height as i32;
+    let mut pixels = base.pixels.clone();
+    capture::bgra_from_rgba(&mut pixels);
+
+    let screen = ScreenDc::for_screen();
+    let canvas = BitmapDc::from_bgra(screen.handle(), width, height, &pixels)?;
+
+    for annotation in annotations {
+        let rect = normalized(annotation.start, annotation.end);
+        let local = RECT {
+            left: rect.left - target.left,
+            top: rect.top - target.top,
+            right: rect.right - target.left,
+            bottom: rect.bottom - target.top,
+        };
+
+        if let Some(effect) = annotation.effect.as_ref() {
+            if annotation.tool.is_effect() {
+                let w = local.right - local.left;
+                let h = local.bottom - local.top;
+                if w > 0 && h > 0 {
+                    unsafe {
+                        let _ = BitBlt(
+                            canvas.handle(),
+                            local.left,
+                            local.top,
+                            w,
+                            h,
+                            effect.handle(),
+                            0,
+                            0,
+                            SRCCOPY,
+                        );
+                    }
+                }
+                continue;
+            }
+        }
+
+        if annotation.tool.is_shape() {
+            paint_shape(
+                canvas.handle(),
+                annotation.tool,
+                offset_point(annotation.start, target),
+                offset_point(annotation.end, target),
+                annotation.width,
+                ANNOTATION,
+            );
+        }
+    }
+
+    let mut out = canvas.read_bgra(width, height)?;
+    capture::rgba_from_bgra(&mut out);
+    Some(CapturedImage {
+        width: width as u32,
+        height: height as u32,
+        pixels: out,
+    })
+}
+
+fn make_effect(tool: Tool, rect: &RECT, dpi: u32) -> Option<BitmapDc> {
+    snapshot::with_current(|snap| match tool {
+        Tool::Pixelate => snap.pixelate_bitmap(rect, s(10, dpi).clamp(6, 24)),
+        Tool::Blur => snap.blur_bitmap(rect, s(8, dpi).clamp(4, 16)),
+        _ => None,
+    })
+    .flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -465,13 +832,8 @@ fn paint_overlay(hwnd: HWND) {
         let _ = GetClientRect(hwnd, &mut client);
     }
 
-    let (selection, hover_rect, is_selecting, pointer_down) = app::with_state(|s| {
-        (
-            s.selection,
-            s.hover_rect,
-            s.selection.active,
-            s.pointer_down,
-        )
+    let (selection, hover_rect, pointer_down) = app::with_state(|s| {
+        (s.selection, s.hover_rect, s.pointer_down)
     });
 
     let has_hover = hover_rect.right - hover_rect.left > 2
@@ -481,7 +843,7 @@ fn paint_overlay(hwnd: HWND) {
     unsafe {
         let _ = GetCursorPos(&mut cursor_screen);
     }
-    let dpi = ui::dpi_for_point(cursor_screen).max(96);
+    let dpi = dpi_at(cursor_screen);
     let cursor = POINT {
         x: cursor_screen.x - window_rect.left,
         y: cursor_screen.y - window_rect.top,
@@ -490,9 +852,8 @@ fn paint_overlay(hwnd: HWND) {
     let painted = snapshot::with_current(|snap| {
         snap.paint_background(hdc);
 
-        if is_selecting {
-            let sel = app::selection_rect(&selection);
-            snap.paint_bright(hdc, &sel);
+        if selection.active {
+            snap.paint_bright(hdc, &app::selection_rect(&selection));
         } else if has_hover {
             snap.paint_bright(hdc, &hover_rect);
         }
@@ -506,17 +867,36 @@ fn paint_overlay(hwnd: HWND) {
         }
     }
 
-    // Перекрестие не рисуем: координаты и размер уже показываются плашками.
+    let sel_local = if selection.active {
+        Some(screen_to_local(&app::selection_rect(&selection), &window_rect))
+    } else {
+        None
+    };
 
-    if is_selecting {
-        let screen_rect = app::selection_rect(&selection);
-        let local = screen_to_local(&screen_rect, &window_rect);
-        draw_highlight(hdc, &local, dpi);
+    if let Some(local) = &sel_local {
+        // Аннотации не должны выходить за пределы выделения.
+        app::with_state(|s| {
+            unsafe {
+                let saved = SaveDC(hdc);
+                let _ = IntersectClipRect(hdc, local.left, local.top, local.right, local.bottom);
+                paint_annotations(
+                    hdc,
+                    &window_rect,
+                    &s.annotations,
+                    s.draft.as_ref(),
+                    s.tool,
+                    dpi,
+                );
+                let _ = RestoreDC(hdc, saved);
+            }
+        });
+
+        draw_highlight(hdc, local, dpi);
         draw_size_badge(
             hdc,
-            &local,
-            screen_rect.right - screen_rect.left,
-            screen_rect.bottom - screen_rect.top,
+            local,
+            selection_rect_width(&selection),
+            selection_rect_height(&selection),
             &client,
             dpi,
         );
@@ -554,9 +934,370 @@ fn paint_overlay(hwnd: HWND) {
         PANEL_BORDER,
         dpi,
     );
+
+    // Панель инструментов — последней, чтобы она была поверх всего.
+    let (active_tool, hot) = app::with_state(|s| (s.tool, s.hot));
+    let layout = toolbar_layout(hdc, &window_rect, cursor_screen, &selection, dpi);
+    draw_toolbar(hdc, &layout, active_tool, hot, dpi);
 }
 
-fn draw_highlight(hdc: windows::Win32::Graphics::Gdi::HDC, local: &RECT, dpi: u32) {
+fn selection_rect_width(selection: &Selection) -> i32 {
+    (selection.start.x - selection.current.x).abs()
+}
+
+fn selection_rect_height(selection: &Selection) -> i32 {
+    (selection.start.y - selection.current.y).abs()
+}
+
+fn paint_annotations(
+    hdc: HDC,
+    window: &RECT,
+    annotations: &[Annotation],
+    draft: Option<&Draft>,
+    tool: Tool,
+    dpi: u32,
+) {
+    for annotation in annotations {
+        let rect = normalized(annotation.start, annotation.end);
+        let local = screen_to_local(&rect, window);
+
+        if annotation.tool.is_effect() {
+            if let Some(effect) = annotation.effect.as_ref() {
+                let w = local.right - local.left;
+                let h = local.bottom - local.top;
+                if w > 0 && h > 0 {
+                    unsafe {
+                        let _ = BitBlt(
+                            hdc,
+                            local.left,
+                            local.top,
+                            w,
+                            h,
+                            effect.handle(),
+                            0,
+                            0,
+                            SRCCOPY,
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        if annotation.tool.is_shape() {
+            paint_shape(
+                hdc,
+                annotation.tool,
+                screen_to_local_point(annotation.start, window),
+                screen_to_local_point(annotation.end, window),
+                annotation.width,
+                ANNOTATION,
+            );
+        }
+    }
+
+    let Some(draft) = draft else {
+        return;
+    };
+
+    if tool.is_effect() {
+        // Живое превью эффекта, если оно уже готово, иначе акцентная рамка.
+        let preview_rect = draft.preview_rect.unwrap_or_else(|| {
+            normalized(draft.start, draft.end)
+        });
+        let local = screen_to_local(&preview_rect, window);
+        if let Some(preview) = draft.preview.as_ref() {
+            let w = local.right - local.left;
+            let h = local.bottom - local.top;
+            if w > 0 && h > 0 {
+                unsafe {
+                    let _ = BitBlt(
+                        hdc,
+                        local.left,
+                        local.top,
+                        w,
+                        h,
+                        preview.handle(),
+                        0,
+                        0,
+                        SRCCOPY,
+                    );
+                }
+            }
+        } else {
+            ui::stroke_rect(hdc, &local, s(2, dpi).max(2), ACCENT);
+        }
+    } else if tool.is_shape() {
+        paint_shape(
+            hdc,
+            tool,
+            screen_to_local_point(draft.start, window),
+            screen_to_local_point(draft.end, window),
+            s(3, dpi).max(2),
+            ANNOTATION,
+        );
+    }
+}
+
+/// Нарисовать фигуру инструментом GDI (используется и в оверлее, и в снимке).
+fn paint_shape(hdc: HDC, tool: Tool, from: POINT, to: POINT, width: i32, color: u32) {
+    let pen = GdiPen::solid(width.max(1), color);
+    unsafe {
+        let old_pen = SelectObject(hdc, pen.handle());
+
+        match tool {
+            Tool::Line => {
+                let _ = MoveToEx(hdc, from.x, from.y, None);
+                let _ = LineTo(hdc, to.x, to.y);
+            }
+            Tool::Arrow => {
+                draw_arrow(hdc, from, to, width, color);
+            }
+            Tool::Rect => {
+                let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                let _ = Rectangle(
+                    hdc,
+                    from.x.min(to.x),
+                    from.y.min(to.y),
+                    from.x.max(to.x),
+                    from.y.max(to.y),
+                );
+                SelectObject(hdc, old_brush);
+            }
+            Tool::Ellipse => {
+                let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                let _ = Ellipse(
+                    hdc,
+                    from.x.min(to.x),
+                    from.y.min(to.y),
+                    from.x.max(to.x),
+                    from.y.max(to.y),
+                );
+                SelectObject(hdc, old_brush);
+            }
+            _ => {}
+        }
+
+        SelectObject(hdc, old_pen);
+    }
+}
+
+fn draw_arrow(hdc: HDC, from: POINT, to: POINT, width: i32, color: u32) {
+    let dx = (to.x - from.x) as f32;
+    let dy = (to.y - from.y) as f32;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length < 1.0 {
+        return;
+    }
+
+    unsafe {
+        let _ = MoveToEx(hdc, from.x, from.y, None);
+        let _ = LineTo(hdc, to.x, to.y);
+
+        let angle = dy.atan2(dx);
+        let head = ((width as f32) * 4.5).max(12.0).min(length * 0.6);
+        let a1 = angle + std::f32::consts::PI - 0.45;
+        let a2 = angle - std::f32::consts::PI + 0.45;
+
+        let points = [
+            to,
+            POINT {
+                x: to.x + (a1.cos() * head) as i32,
+                y: to.y + (a1.sin() * head) as i32,
+            },
+            POINT {
+                x: to.x + (a2.cos() * head) as i32,
+                y: to.y + (a2.sin() * head) as i32,
+            },
+        ];
+
+        let brush = GdiBrush::solid(color);
+        let old_brush = SelectObject(hdc, brush.handle());
+        let _ = Polygon(hdc, &points);
+        SelectObject(hdc, old_brush);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Панель инструментов
+// ---------------------------------------------------------------------------
+
+fn toolbar_layout(
+    hdc: HDC,
+    window: &RECT,
+    cursor_screen: POINT,
+    selection: &Selection,
+    dpi: u32,
+) -> ToolbarLayout {
+    let font = ui::make_font(s(13, dpi), 600);
+    let pad_x = s(12, dpi);
+    let pad = s(6, dpi);
+    let gap = s(4, dpi);
+    let btn_h = s(32, dpi);
+
+    let mut specs: Vec<(&str, ToolbarHit)> = Tool::ALL
+        .iter()
+        .map(|tool| (tool.label(), ToolbarHit::Tool(*tool)))
+        .collect();
+    specs.push(("Копировать", ToolbarHit::Copy));
+
+    let mut widths = Vec::with_capacity(specs.len());
+    let mut content_w = 0;
+    for (label, _) in &specs {
+        let width = ui::measure_text(hdc, label, font).cx + pad_x * 2;
+        widths.push(width);
+        content_w += width;
+    }
+    content_w += gap * (specs.len() as i32 - 1);
+
+    let panel_w = content_w + pad * 2;
+    let panel_h = btn_h + pad * 2;
+
+    unsafe {
+        let _ = DeleteObject(font);
+    }
+
+    let monitor = monitor_local_rect(cursor_screen, window);
+    let margin = s(12, dpi);
+    let min_left = monitor.left + margin;
+    let max_left = (monitor.right - panel_w - margin).max(min_left);
+    let min_top = monitor.top + margin;
+    let max_top = (monitor.bottom - panel_h - margin).max(min_top);
+
+    let mut left;
+    let mut top;
+
+    if selection.active {
+        let sel = screen_to_local(&app::selection_rect(selection), window);
+        left = (sel.left + sel.right - panel_w) / 2;
+        top = sel.bottom + s(10, dpi);
+
+        // Снизу не помещается — ставим над областью, иначе внутри неё.
+        if top + panel_h > monitor.bottom - margin {
+            top = sel.top - panel_h - s(10, dpi);
+        }
+        if top < min_top {
+            top = (sel.bottom - panel_h - s(8, dpi)).max(min_top);
+        }
+    } else {
+        left = (monitor.left + monitor.right - panel_w) / 2;
+        top = monitor.bottom - panel_h - s(18, dpi);
+    }
+
+    left = left.clamp(min_left, max_left);
+    top = top.clamp(min_top, max_top);
+
+    let panel = RECT {
+        left,
+        top,
+        right: left + panel_w,
+        bottom: top + panel_h,
+    };
+
+    let mut buttons = Vec::with_capacity(specs.len());
+    let mut x = left + pad;
+    for ((_, hit), width) in specs.into_iter().zip(widths) {
+        let rect = RECT {
+            left: x,
+            top: top + pad,
+            right: x + width,
+            bottom: top + pad + btn_h,
+        };
+        buttons.push((rect, hit));
+        x += width + gap;
+    }
+
+    ToolbarLayout { panel, buttons }
+}
+
+fn toolbar_hit(hwnd: HWND, cursor: POINT) -> Option<ToolbarHit> {
+    let mut window = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(hwnd, &mut window);
+        if window.right <= window.left {
+            return None;
+        }
+    }
+
+    let selection = app::with_state(|s| s.selection);
+    let dpi = dpi_at(cursor);
+    let local = POINT {
+        x: cursor.x - window.left,
+        y: cursor.y - window.top,
+    };
+
+    let screen = ScreenDc::for_screen();
+    let layout = toolbar_layout(screen.handle(), &window, cursor, &selection, dpi);
+    layout
+        .buttons
+        .iter()
+        .find(|(rect, _)| point_in_rect(local, rect))
+        .map(|(_, hit)| *hit)
+}
+
+fn hot_key(hit: Option<ToolbarHit>) -> i32 {
+    match hit {
+        None => 0,
+        Some(ToolbarHit::Tool(tool)) => {
+            Tool::ALL
+                .iter()
+                .position(|item| *item == tool)
+                .map_or(0, |index| index as i32 + 1)
+        }
+        Some(ToolbarHit::Copy) => Tool::ALL.len() as i32 + 1,
+    }
+}
+
+fn draw_toolbar(hdc: HDC, layout: &ToolbarLayout, active: Tool, hot: i32, dpi: u32) {
+    ui::frosted_round_rect(
+        hdc,
+        &layout.panel,
+        s(14, dpi),
+        PANEL_BG_BGRA,
+        220,
+        PANEL_BORDER,
+        34,
+    );
+
+    let font = ui::make_font(s(13, dpi), 600);
+
+    for (index, (rect, hit)) in layout.buttons.iter().enumerate() {
+        let is_copy = matches!(hit, ToolbarHit::Copy);
+        let is_active = matches!(hit, ToolbarHit::Tool(tool) if *tool == active);
+        let is_hot = hot == index as i32 + 1;
+
+        let (tint, alpha, border, sheen_top, fg) = if is_copy {
+            (ACCENT_BGRA, 210, COPY_BORDER, 60, WHITE)
+        } else if is_active {
+            (ACCENT_BGRA, 120, ACCENT, 38, WHITE)
+        } else if is_hot {
+            ([0xFF, 0xFF, 0xFF, 255], 40, ACCENT, 24, WHITE)
+        } else {
+            ([0xFF, 0xFF, 0xFF, 255], 16, PANEL_BORDER, 14, TEXT_MAIN)
+        };
+
+        ui::frosted_round_rect(hdc, rect, s(9, dpi), tint, alpha, border, sheen_top);
+
+        let label = match hit {
+            ToolbarHit::Tool(tool) => tool.label(),
+            ToolbarHit::Copy => "Копировать",
+        };
+        let text = ui::measure_text(hdc, label, font);
+        let x = rect.left + (rect.right - rect.left - text.cx) / 2;
+        let y = rect.top + (rect.bottom - rect.top - text.cy) / 2;
+        ui::draw_text(hdc, x, y, label, font, fg);
+    }
+
+    unsafe {
+        let _ = DeleteObject(font);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Плашки и вспомогательные преобразования
+// ---------------------------------------------------------------------------
+
+fn draw_highlight(hdc: HDC, local: &RECT, dpi: u32) {
     // Белая внешняя кромка + акцентная рамка внутри, чтобы граница читалась
     // и на светлых, и на тёмных окнах.
     let outer = RECT {
@@ -570,7 +1311,7 @@ fn draw_highlight(hdc: windows::Win32::Graphics::Gdi::HDC, local: &RECT, dpi: u3
 }
 
 fn draw_size_badge(
-    hdc: windows::Win32::Graphics::Gdi::HDC,
+    hdc: HDC,
     local: &RECT,
     width: i32,
     height: i32,
@@ -615,7 +1356,7 @@ fn draw_size_badge(
 }
 
 fn draw_coord_badge(
-    hdc: windows::Win32::Graphics::Gdi::HDC,
+    hdc: HDC,
     cursor: POINT,
     text: &str,
     client: &RECT,
@@ -658,6 +1399,40 @@ fn draw_coord_badge(
     );
 }
 
+fn dpi_at(point: POINT) -> u32 {
+    ui::dpi_for_point(point).max(96)
+}
+
+fn point_in_rect(point: POINT, rect: &RECT) -> bool {
+    point.x >= rect.left
+        && point.x < rect.right
+        && point.y >= rect.top
+        && point.y < rect.bottom
+}
+
+fn clamp_point(point: POINT, rect: &RECT) -> POINT {
+    POINT {
+        x: point.x.clamp(rect.left, rect.right),
+        y: point.y.clamp(rect.top, rect.bottom),
+    }
+}
+
+/// Нормализованный прямоугольник (left ≤ right, top ≤ bottom).
+fn normalized(a: POINT, b: POINT) -> RECT {
+    RECT {
+        left: a.x.min(b.x),
+        top: a.y.min(b.y),
+        right: a.x.max(b.x),
+        bottom: a.y.max(b.y),
+    }
+}
+
+fn offset_point(point: POINT, target: &RECT) -> POINT {
+    POINT {
+        x: point.x - target.left,
+        y: point.y - target.top,
+    }
+}
 
 fn screen_to_local(screen: &RECT, window: &RECT) -> RECT {
     RECT {
@@ -665,6 +1440,13 @@ fn screen_to_local(screen: &RECT, window: &RECT) -> RECT {
         top: screen.top - window.top,
         right: screen.right - window.left,
         bottom: screen.bottom - window.top,
+    }
+}
+
+fn screen_to_local_point(point: POINT, window: &RECT) -> POINT {
+    POINT {
+        x: point.x - window.left,
+        y: point.y - window.top,
     }
 }
 

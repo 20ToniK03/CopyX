@@ -109,6 +109,14 @@ pub fn rgba_from_bgra(pixels: &mut [u8]) {
     }
 }
 
+/// Convert RGBA pixels to BGRA in place (for GDI bitmaps).
+pub fn bgra_from_rgba(pixels: &mut [u8]) {
+    for chunk in pixels.chunks_exact_mut(4) {
+        chunk.swap(0, 2);
+        chunk[3] = 255;
+    }
+}
+
 pub fn capture_full_screen() -> Result<CapturedImage, String> {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
