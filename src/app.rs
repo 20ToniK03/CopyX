@@ -25,6 +25,10 @@ pub struct AppState {
     pub draft: Option<Draft>,
     /// Подсвеченная кнопка панели инструментов (0 — нет, 1–7 — инструмент, 8 — «Копировать»).
     pub hot: i32,
+    /// Индекс выделенной фигуры (для поворота и удаления).
+    pub selected: Option<usize>,
+    /// Пользователь тянет ручку поворота выделенной фигуры.
+    pub rotating: bool,
 }
 
 /// Инструменты редактора, доступные после нажатия PrtSc.
@@ -77,15 +81,40 @@ pub struct Annotation {
     pub tool: Tool,
     pub start: POINT,
     pub end: POINT,
+    /// Поворот фигуры вокруг центра её рамки, в радианах.
+    pub angle: f32,
     /// Толщина линии, уже масштабированная под DPI.
     pub width: i32,
     pub effect: Option<BitmapDc>,
+}
+
+impl Annotation {
+    /// Прямоугольник фигуры без учёта поворота.
+    pub fn bounds(&self) -> RECT {
+        RECT {
+            left: self.start.x.min(self.end.x),
+            top: self.start.y.min(self.end.y),
+            right: self.start.x.max(self.end.x),
+            bottom: self.start.y.max(self.end.y),
+        }
+    }
+
+    /// Центр вращения — центр рамки фигуры.
+    pub fn center(&self) -> POINT {
+        let bounds = self.bounds();
+        POINT {
+            x: (bounds.left + bounds.right) / 2,
+            y: (bounds.top + bounds.bottom) / 2,
+        }
+    }
 }
 
 /// Черновик аннотации, пока пользователь тянет мышь.
 pub struct Draft {
     pub start: POINT,
     pub end: POINT,
+    /// Shift удерживался в последнем движении: ровная фигура/линия.
+    pub snap: bool,
     /// Живое превью эффекта: обновляется не чаще, чем раз в несколько кадров.
     pub preview: Option<BitmapDc>,
     /// Область, для которой построено превью.
@@ -99,6 +128,7 @@ impl Draft {
         Self {
             start,
             end: start,
+            snap: false,
             preview: None,
             preview_rect: None,
             preview_at: None,
@@ -138,6 +168,8 @@ impl Default for AppState {
             annotations: Vec::new(),
             draft: None,
             hot: 0,
+            selected: None,
+            rotating: false,
         }
     }
 }

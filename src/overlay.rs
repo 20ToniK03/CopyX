@@ -32,9 +32,10 @@ use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, DeleteObject, Ellipse, FillRect, GetMonitorInfoW, GetStockObject, IntersectClipRect,
-    InvalidateRect, LineTo, MonitorFromPoint, MoveToEx, Polygon, Rectangle, RestoreDC, SaveDC,
-    SelectObject, UpdateWindow, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, SRCCOPY,
+    Arc, BitBlt, DeleteObject, Ellipse, FillRect, GetMonitorInfoW, GetStockObject,
+    IntersectClipRect, InvalidateRect, LineTo, MonitorFromPoint, MoveToEx, Polygon, Polyline,
+    RestoreDC, SaveDC, SelectObject, UpdateWindow, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    NULL_BRUSH, NULL_PEN, SRCCOPY,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus};
@@ -42,6 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 // --- Палитра (COLORREF = 0x00BBGGRR) ---
 const ACCENT: u32 = 0x00FFB86B; // RGB(107, 184, 255) — мягкий голубой
+const ACCENT_HOT: u32 = 0x00FFD7A0; // RGB(160, 215, 255) — подсвеченная ручка
 const ACCENT_BGRA: [u8; 4] = [0xFF, 0xB8, 0x6B, 255];
 const PANEL_BG: u32 = 0x00221612; // тёмное "стекло" RGB(18, 22, 34)
 const PANEL_BG_BGRA: [u8; 4] = [0x12, 0x16, 0x22, 255]; // тот же цвет в BGRA
@@ -60,7 +62,7 @@ const HINT_SELECT: &str =
 
 /// Подсказка редактора: панель инструментов уже доступна.
 const HINT_EDIT: &str =
-    "1–7 — инструменты · Enter/Ctrl+C — копировать · Ctrl+Z — шаг назад · Esc/ПКМ — закрыть";
+    "1–7 — инструменты · Shift — ровная фигура · клик по контуру — поворот · Enter — копировать";
 
 /// Кнопки панели инструментов.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -113,6 +115,8 @@ pub fn show(instance: HINSTANCE) {
         s.annotations.clear();
         s.draft = None;
         s.hot = 0;
+        s.selected = None;
+        s.rotating = false;
     });
 
     unsafe {
@@ -145,6 +149,8 @@ pub fn hide() {
         s.annotations.clear();
         s.draft = None;
         s.hot = 0;
+        s.selected = None;
+        s.rotating = false;
         s.overlay_hwnd
     });
     if hwnd.0 != 0 {
@@ -314,8 +320,20 @@ unsafe extern "system" fn overlay_proc(
             let key = wparam.0 as u32;
             let ctrl = ctrl_down();
             match key {
-                // Esc — отмена всего снимка.
-                0x1B => hide(),
+                // Esc — снять выделение с фигуры, иначе закрыть оверлей.
+                0x1B => {
+                    let deselected = app::with_state(|s| {
+                        s.rotating = false;
+                        s.selected.take().is_some()
+                    });
+                    if deselected {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    } else {
+                        hide();
+                    }
+                }
+                // Delete / Backspace — удалить выделенную фигуру.
+                0x2E | 0x08 => delete_selected(hwnd),
                 // Enter — скопировать текущее выделение (или окно под курсором).
                 0x0D => {
                     if let Some(target) = current_target() {
@@ -347,11 +365,32 @@ unsafe extern "system" fn overlay_proc(
             LRESULT(0)
         }
 
+        // Потеря фокуса/отмена режима — жест прерываем, чтобы состояние
+        // перетаскивания не «залипло».
+        WM_KILLFOCUS | WM_CANCELMODE => {
+            app::with_state(|s| {
+                s.pointer_down = false;
+                s.rotating = false;
+            });
+            LRESULT(0)
+        }
+
         WM_SETCURSOR => {
             let mut cursor = POINT::default();
             let _ = GetCursorPos(&mut cursor);
-            let arrow = toolbar_hit(hwnd, cursor).is_some();
-            let shape = if arrow { IDC_ARROW } else { IDC_CROSS };
+            let dpi = dpi_at(cursor);
+            let over_toolbar = toolbar_hit(hwnd, cursor).is_some();
+            let over_handle = rotation_handle_at(cursor, dpi).is_some();
+            let over_shape = !over_handle
+                && app::with_state(|s| s.tool == Tool::Select && !s.rotating)
+                && hit_annotation_at(cursor, dpi).is_some();
+            let shape = if over_toolbar {
+                IDC_ARROW
+            } else if over_handle || over_shape {
+                IDC_HAND
+            } else {
+                IDC_CROSS
+            };
             if let Ok(handle) = LoadCursorW(None, shape) {
                 SetCursor(handle);
             }
@@ -375,7 +414,33 @@ unsafe extern "system" fn overlay_proc(
                 return LRESULT(0);
             }
 
+            let dpi = dpi_at(cursor);
+
+            // Ручка поворота выделенной фигуры — приоритетнее всего остального.
+            if let Some(index) = rotation_handle_at(cursor, dpi) {
+                app::with_state(|s| {
+                    s.selected = Some(index);
+                    s.rotating = true;
+                    s.pointer_down = true;
+                });
+                let _ = InvalidateRect(hwnd, None, false);
+                return LRESULT(0);
+            }
+
             let (selection, tool) = app::with_state(|s| (s.selection, s.tool));
+
+            // Инструмент «Область»: клик по контуру выбирает фигуру для поворота.
+            if tool == Tool::Select {
+                if let Some(index) = hit_annotation_at(cursor, dpi) {
+                    app::with_state(|s| {
+                        s.selected = Some(index);
+                        s.rotating = false;
+                    });
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
+            }
+
             let sel_rect = app::selection_rect(&selection);
             let inside_selection = selection.active
                 && sel_rect.right - sel_rect.left > 4
@@ -389,6 +454,8 @@ unsafe extern "system" fn overlay_proc(
                     s.pointer_down = true;
                     s.capture_state = CaptureState::Selecting;
                     s.draft = Some(Draft::new(start));
+                    s.selected = None;
+                    s.rotating = false;
                 });
                 let _ = InvalidateRect(hwnd, None, false);
                 return LRESULT(0);
@@ -405,6 +472,8 @@ unsafe extern "system" fn overlay_proc(
                 s.hover_rect = bounds;
                 s.annotations.clear();
                 s.draft = None;
+                s.selected = None;
+                s.rotating = false;
                 s.capture_state = CaptureState::OverlayShown;
             });
             let _ = InvalidateRect(hwnd, None, false);
@@ -415,21 +484,56 @@ unsafe extern "system" fn overlay_proc(
             let mut cursor = POINT::default();
             let _ = GetCursorPos(&mut cursor);
             let dpi = dpi_at(cursor);
+            // Состояние ЛКМ именно на момент генерации сообщения: очередь
+            // сообщений может отставать, поэтому GetKeyState ненадёжен.
+            let message_button = (wparam.0 as u32 & 0x0001) != 0; // MK_LBUTTON
+
+            // Тянем ручку поворота: угол считается от центра фигуры.
+            if app::with_state(|s| s.rotating) {
+                // Защита от потерянного WM_LBUTTONUP (Alt+Tab, смена фокуса,
+                // синтетический ввод): кнопка отпущена и в сообщении, и сейчас.
+                if !message_button && !left_button_down() {
+                    app::with_state(|s| {
+                        s.rotating = false;
+                        s.pointer_down = false;
+                    });
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
+                apply_rotation(cursor);
+                let _ = InvalidateRect(hwnd, None, false);
+                return LRESULT(0);
+            }
 
             let (pointer_down, has_draft, selection) =
                 app::with_state(|s| (s.pointer_down, s.draft.is_some(), s.selection));
+
+            // Та же страховка для рисования/выделения: если UP потерялся,
+            // завершаем жест штатным обработчиком.
+            if pointer_down && !message_button && !left_button_down() {
+                let _ = PostMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), LPARAM(0));
+                return LRESULT(0);
+            }
 
             if pointer_down {
                 if has_draft {
                     // Тянем аннотацию внутри выделения.
                     let sel_rect = app::selection_rect(&selection);
                     let tool = app::with_state(|s| s.tool);
+                    let shift = shift_down();
                     let (preview_request, moved) = app::with_state(|s| {
                         let end = clamp_point(cursor, &sel_rect);
                         let mut request = None;
                         let mut moved = false;
 
                         if let Some(draft) = s.draft.as_mut() {
+                            // Shift держит квадрат/круг и линии по 45°.
+                            draft.snap = shift;
+                            let end = if shift {
+                                clamp_point(constrain_end(tool, draft.start, end), &sel_rect)
+                            } else {
+                                end
+                            };
                             if draft.end.x != end.x || draft.end.y != end.y {
                                 draft.end = end;
                                 moved = true;
@@ -523,6 +627,16 @@ unsafe extern "system" fn overlay_proc(
             let _ = GetCursorPos(&mut cursor);
             let dpi = dpi_at(cursor);
 
+            if app::with_state(|s| s.rotating) {
+                apply_rotation(cursor);
+                app::with_state(|s| {
+                    s.rotating = false;
+                    s.pointer_down = false;
+                });
+                let _ = InvalidateRect(hwnd, None, false);
+                return LRESULT(0);
+            }
+
             let (pointer_down, has_draft) =
                 app::with_state(|s| (s.pointer_down, s.draft.is_some()));
             if !pointer_down {
@@ -539,7 +653,12 @@ unsafe extern "system" fn overlay_proc(
                 if let Some(draft_ref) = draft.as_mut() {
                     // Последний WM_MOUSEMOVE мог не успеть за курсором —
                     // фиксируем точный конец перетаскивания здесь.
-                    draft_ref.end = clamp_point(cursor, &sel_rect);
+                    let end = clamp_point(cursor, &sel_rect);
+                    draft_ref.end = if shift_down() || draft_ref.snap {
+                        clamp_point(constrain_end(tool, draft_ref.start, end), &sel_rect)
+                    } else {
+                        end
+                    };
                 }
 
                 if let Some(draft) = draft {
@@ -566,9 +685,11 @@ unsafe extern "system" fn overlay_proc(
                                         x: rect.right,
                                         y: rect.bottom,
                                     },
+                                    angle: 0.0,
                                     width: 0,
                                     effect: Some(effect),
                                 });
+                                state.selected = None;
                             });
                         }
                     } else if big_enough && tool.is_shape() {
@@ -578,9 +699,13 @@ unsafe extern "system" fn overlay_proc(
                                 tool,
                                 start: draft.start,
                                 end: draft.end,
+                                angle: 0.0,
                                 width: stroke,
                                 effect: None,
                             });
+                            // Свежая фигура сразу выделена — ручка поворота рядом.
+                            state.selected = Some(state.annotations.len() - 1);
+                            state.rotating = false;
                         });
                     }
                 }
@@ -673,6 +798,7 @@ fn select_all(hwnd: HWND) {
         };
         s.annotations.clear();
         s.draft = None;
+        s.selected = None;
         s.capture_state = CaptureState::Selecting;
     });
     let _ = unsafe { InvalidateRect(hwnd, None, false) };
@@ -683,9 +809,50 @@ fn undo(hwnd: HWND) {
         if s.draft.is_some() || s.pointer_down {
             return false;
         }
+        s.selected = None;
+        s.rotating = false;
         s.annotations.pop().is_some()
     });
     if changed {
+        let _ = unsafe { InvalidateRect(hwnd, None, false) };
+    }
+}
+
+/// Угол поворота выделенной фигуры по положению курсора.
+fn apply_rotation(cursor: POINT) {
+    let snap = shift_down();
+    app::with_state(|s| {
+        let Some(index) = s.selected else {
+            return;
+        };
+        let Some(annotation) = s.annotations.get(index) else {
+            return;
+        };
+        let center = annotation.center();
+        let angle = ((cursor.y - center.y) as f32).atan2((cursor.x - center.x) as f32)
+            + std::f32::consts::FRAC_PI_2;
+        let angle = if snap {
+            snap_angle(angle, std::f32::consts::PI / 12.0)
+        } else {
+            angle
+        };
+        if let Some(annotation) = s.annotations.get_mut(index) {
+            annotation.angle = angle;
+        }
+    });
+}
+
+fn delete_selected(hwnd: HWND) {
+    let removed = app::with_state(|s| match s.selected {
+        Some(index) if index < s.annotations.len() => {
+            s.annotations.remove(index);
+            s.selected = None;
+            s.rotating = false;
+            true
+        }
+        _ => false,
+    });
+    if removed {
         let _ = unsafe { InvalidateRect(hwnd, None, false) };
     }
 }
@@ -696,9 +863,11 @@ fn set_tool(hwnd: HWND, tool: Tool) {
         if s.pointer_down || !s.selection.active {
             return false;
         }
-        let changed = s.tool != tool;
+        let changed = s.tool != tool || s.selected.is_some();
         s.tool = tool;
         s.hot = 0;
+        s.selected = None;
+        s.rotating = false;
         changed
     });
     if changed {
@@ -804,6 +973,7 @@ fn compose(
                 annotation.tool,
                 offset_point(annotation.start, target),
                 offset_point(annotation.end, target),
+                annotation.angle,
                 annotation.width,
                 ANNOTATION,
             );
@@ -910,8 +1080,14 @@ fn paint_overlay(hwnd: HWND) {
 }
 
 fn paint_scene(hdc: HDC, window_rect: &RECT, client: &RECT) {
-    let (selection, hover_rect, pointer_down, has_draft) = app::with_state(|s| {
-        (s.selection, s.hover_rect, s.pointer_down, s.draft.is_some())
+    let (selection, hover_rect, pointer_down, has_draft, rotating) = app::with_state(|s| {
+        (
+            s.selection,
+            s.hover_rect,
+            s.pointer_down,
+            s.draft.is_some(),
+            s.rotating,
+        )
     });
 
     // Пока пользователь тянет новую рамку, панель не показываем: она бы
@@ -996,9 +1172,20 @@ fn paint_scene(hdc: HDC, window_rect: &RECT, client: &RECT) {
         );
     }
 
+    // Рамка и ручка поворота выделенной фигуры. Рисуем вне клипа выделения,
+    // чтобы ручку не срезало у верхней границы области.
+    app::with_state(|state| {
+        if let Some(annotation) = state.selected.and_then(|index| state.annotations.get(index)) {
+            let handle = rotate_handle_center(annotation, dpi);
+            let hot = (cursor_screen.x - handle.x).abs() <= s(12, dpi)
+                && (cursor_screen.y - handle.y).abs() <= s(12, dpi);
+            draw_annotation_selection(hdc, window_rect, annotation, dpi, hot);
+        }
+    });
+
     // Координаты курсора — только во время протяжки, чтобы не гонять
     // перерисовку на каждое движение мыши.
-    if pointer_down {
+    if pointer_down && !rotating {
         let coord_text = format!("{}, {}", cursor_screen.x, cursor_screen.y);
         draw_coord_badge(hdc, cursor, &coord_text, client, dpi);
     }
@@ -1080,6 +1267,7 @@ fn paint_annotations(
                 annotation.tool,
                 screen_to_local_point(annotation.start, window),
                 screen_to_local_point(annotation.end, window),
+                annotation.angle,
                 annotation.width,
                 ANNOTATION,
             );
@@ -1123,47 +1311,388 @@ fn paint_annotations(
             tool,
             screen_to_local_point(draft.start, window),
             screen_to_local_point(draft.end, window),
+            0.0,
             s(3, dpi).max(2),
             ANNOTATION,
         );
     }
 }
 
+// ---------------------------------------------------------------------------
+// Геометрия фигур: поворот, Shift-ограничения и попадание курсора
+// ---------------------------------------------------------------------------
+
+fn shift_down() -> bool {
+    unsafe { GetKeyState(0x10) < 0 } // VK_SHIFT
+}
+
+fn left_button_down() -> bool {
+    unsafe { GetKeyState(0x01) < 0 } // VK_LBUTTON
+}
+
+/// Поворот точки вокруг центра (радианы; ось Y направлена вниз).
+fn rotate_point(point: POINT, center: POINT, angle: f32) -> POINT {
+    if angle == 0.0 {
+        return point;
+    }
+    let (sin, cos) = angle.sin_cos();
+    let dx = (point.x - center.x) as f32;
+    let dy = (point.y - center.y) as f32;
+    POINT {
+        x: center.x + (dx * cos - dy * sin).round() as i32,
+        y: center.y + (dx * sin + dy * cos).round() as i32,
+    }
+}
+
+fn rotate_xy(x: f32, y: f32, cx: f32, cy: f32, sin: f32, cos: f32) -> (f32, f32) {
+    let dx = x - cx;
+    let dy = y - cy;
+    (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos)
+}
+
+fn rect_center(a: POINT, b: POINT) -> POINT {
+    POINT {
+        x: (a.x + b.x) / 2,
+        y: (a.y + b.y) / 2,
+    }
+}
+
+fn snap_angle(angle: f32, step: f32) -> f32 {
+    (angle / step).round() * step
+}
+
+/// Shift во время рисования: квадрат/круг и линия под 0/45/90/135/180°.
+fn constrain_end(tool: Tool, start: POINT, end: POINT) -> POINT {
+    let dx = (end.x - start.x) as f32;
+    let dy = (end.y - start.y) as f32;
+
+    match tool {
+        Tool::Rect | Tool::Ellipse => {
+            let side = dx.abs().max(dy.abs()).round();
+            let sx = if dx < 0.0 { -1.0 } else { 1.0 };
+            let sy = if dy < 0.0 { -1.0 } else { 1.0 };
+            POINT {
+                x: start.x + (side * sx) as i32,
+                y: start.y + (side * sy) as i32,
+            }
+        }
+        Tool::Line | Tool::Arrow => {
+            let length = (dx * dx + dy * dy).sqrt();
+            if length < 1.0 {
+                return end;
+            }
+            let angle = snap_angle(dy.atan2(dx), std::f32::consts::FRAC_PI_4);
+            POINT {
+                x: start.x + (angle.cos() * length).round() as i32,
+                y: start.y + (angle.sin() * length).round() as i32,
+            }
+        }
+        _ => end,
+    }
+}
+
+fn rotated_corners(rect: &RECT, center: POINT, angle: f32) -> [POINT; 4] {
+    [
+        POINT {
+            x: rect.left,
+            y: rect.top,
+        },
+        POINT {
+            x: rect.right,
+            y: rect.top,
+        },
+        POINT {
+            x: rect.right,
+            y: rect.bottom,
+        },
+        POINT {
+            x: rect.left,
+            y: rect.bottom,
+        },
+    ]
+    .map(|point| rotate_point(point, center, angle))
+}
+
+/// Углы рамки фигуры с учётом поворота.
+fn shape_corners(from: POINT, to: POINT, angle: f32) -> [POINT; 4] {
+    let rect = normalized(from, to);
+    let center = POINT {
+        x: (rect.left + rect.right) / 2,
+        y: (rect.top + rect.bottom) / 2,
+    };
+    rotated_corners(&rect, center, angle)
+}
+
+fn ellipse_points(from: POINT, to: POINT, angle: f32, segments: usize) -> Vec<POINT> {
+    let rect = normalized(from, to);
+    let cx = (rect.left + rect.right) as f32 / 2.0;
+    let cy = (rect.top + rect.bottom) as f32 / 2.0;
+    let rx = (rect.right - rect.left) as f32 / 2.0;
+    let ry = (rect.bottom - rect.top) as f32 / 2.0;
+    let (sin, cos) = angle.sin_cos();
+
+    (0..=segments)
+        .map(|i| {
+            let t = i as f32 / segments as f32 * std::f32::consts::TAU;
+            let (x, y) = rotate_xy(cx + rx * t.cos(), cy + ry * t.sin(), cx, cy, sin, cos);
+            POINT {
+                x: x.round() as i32,
+                y: y.round() as i32,
+            }
+        })
+        .collect()
+}
+
+fn distance_to_segment(point: POINT, a: POINT, b: POINT) -> f32 {
+    let (px, py) = (point.x as f32, point.y as f32);
+    let (ax, ay) = (a.x as f32, a.y as f32);
+    let (bx, by) = (b.x as f32, b.y as f32);
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len2 = dx * dx + dy * dy;
+    if len2 < 0.001 {
+        return ((px - ax).powi(2) + (py - ay).powi(2)).sqrt();
+    }
+    let t = (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0);
+    ((px - (ax + dx * t)).powi(2) + (py - (ay + dy * t)).powi(2)).sqrt()
+}
+
+fn near_rect_outline(point: POINT, rect: &RECT, tolerance: f32) -> bool {
+    let corners = [
+        POINT {
+            x: rect.left,
+            y: rect.top,
+        },
+        POINT {
+            x: rect.right,
+            y: rect.top,
+        },
+        POINT {
+            x: rect.right,
+            y: rect.bottom,
+        },
+        POINT {
+            x: rect.left,
+            y: rect.bottom,
+        },
+    ];
+    (0..4).any(|i| distance_to_segment(point, corners[i], corners[(i + 1) % 4]) <= tolerance)
+}
+
+fn near_ellipse_outline(point: POINT, rect: &RECT, tolerance: f32) -> bool {
+    let rx = (rect.right - rect.left) as f32 / 2.0;
+    let ry = (rect.bottom - rect.top) as f32 / 2.0;
+    if rx < 1.0 || ry < 1.0 {
+        return false;
+    }
+    let cx = (rect.left + rect.right) as f32 / 2.0;
+    let cy = (rect.top + rect.bottom) as f32 / 2.0;
+    let nx = (point.x as f32 - cx) / rx;
+    let ny = (point.y as f32 - cy) / ry;
+    let radius = (nx * nx + ny * ny).sqrt();
+    (radius - 1.0).abs() * rx.min(ry) <= tolerance
+}
+
+/// Ближайшая к курсору фигура (только контур, чтобы клики внутри рамки
+/// не мешали новому выделению).
+fn hit_annotation(annotations: &[Annotation], point: POINT, dpi: u32) -> Option<usize> {
+    let base = s(7, dpi).max(5) as f32;
+    for (index, annotation) in annotations.iter().enumerate().rev() {
+        if !annotation.tool.is_shape() {
+            continue;
+        }
+        let tolerance = base + annotation.width as f32;
+        let local = rotate_point(point, annotation.center(), -annotation.angle);
+        let rect = annotation.bounds();
+        let hit = match annotation.tool {
+            Tool::Line | Tool::Arrow => {
+                distance_to_segment(local, annotation.start, annotation.end) <= tolerance
+            }
+            Tool::Rect => near_rect_outline(local, &rect, tolerance),
+            Tool::Ellipse => near_ellipse_outline(local, &rect, tolerance),
+            _ => false,
+        };
+        if hit {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn hit_annotation_at(point: POINT, dpi: u32) -> Option<usize> {
+    app::with_state(|s| hit_annotation(&s.annotations, point, dpi))
+}
+
+/// Центр ручки поворота: над верхней стороной фигуры, с учётом её поворота.
+fn rotate_handle_center(annotation: &Annotation, dpi: u32) -> POINT {
+    let rect = annotation.bounds();
+    let anchor = POINT {
+        x: (rect.left + rect.right) / 2,
+        y: rect.top - s(26, dpi),
+    };
+    rotate_point(anchor, annotation.center(), annotation.angle)
+}
+
+fn rotation_handle_at(point: POINT, dpi: u32) -> Option<usize> {
+    let selected = app::with_state(|s| s.selected)?;
+    app::with_state(|state| {
+        let annotation = state.annotations.get(selected)?;
+        let handle = rotate_handle_center(annotation, dpi);
+        let radius = s(12, dpi).max(8);
+        if (point.x - handle.x).abs() <= radius && (point.y - handle.y).abs() <= radius {
+            Some(selected)
+        } else {
+            None
+        }
+    })
+}
+
+/// Рамка выделенной фигуры и круглая ручка поворота.
+fn draw_annotation_selection(
+    hdc: HDC,
+    window: &RECT,
+    annotation: &Annotation,
+    dpi: u32,
+    hot: bool,
+) {
+    let rect = annotation.bounds();
+    let center = annotation.center();
+
+    // Рамку слегка отодвигаем от контура, чтобы она читалась и у фигур,
+    // у которых контур совпадает с рамкой (прямоугольник).
+    let frame = inflate(&rect, s(4, dpi));
+    let corners = rotated_corners(&frame, center, annotation.angle)
+        .map(|point| screen_to_local_point(point, window));
+    let outline = [
+        corners[0],
+        corners[1],
+        corners[2],
+        corners[3],
+        corners[0],
+    ];
+    let dotted = GdiPen::dotted(ACCENT);
+    unsafe {
+        let old_pen = SelectObject(hdc, dotted.handle());
+        let _ = Polyline(hdc, &outline);
+        SelectObject(hdc, old_pen);
+    }
+
+    // Поводок от верхней стороны рамки к ручке.
+    let anchor = POINT {
+        x: (rect.left + rect.right) / 2,
+        y: frame.top,
+    };
+    let anchor = rotate_point(anchor, center, annotation.angle);
+    let handle = rotate_handle_center(annotation, dpi);
+    let anchor = screen_to_local_point(anchor, window);
+    let handle = screen_to_local_point(handle, window);
+
+    let lead = GdiPen::solid(s(1, dpi).max(1), ACCENT);
+    unsafe {
+        let old_pen = SelectObject(hdc, lead.handle());
+        let _ = MoveToEx(hdc, anchor.x, anchor.y, None);
+        let _ = LineTo(hdc, handle.x, handle.y);
+        SelectObject(hdc, old_pen);
+    }
+
+    let radius = s(9, dpi).max(7);
+    let fill = GdiBrush::solid(if hot { ACCENT_HOT } else { ACCENT });
+    unsafe {
+        let old_brush = SelectObject(hdc, fill.handle());
+        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        let _ = Ellipse(
+            hdc,
+            handle.x - radius,
+            handle.y - radius,
+            handle.x + radius,
+            handle.y + radius,
+        );
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+    }
+
+    // Белая дуга со стрелкой — значок «повернуть».
+    let inner = (radius - s(3, dpi).max(2)).max(3) as f32;
+    let step = std::f32::consts::FRAC_PI_2;
+    let start = -0.9f32;
+    let end = start + step * 2.4;
+    let arc_pen = GdiPen::solid(s(1, dpi).max(1), WHITE);
+    unsafe {
+        let old_pen = SelectObject(hdc, arc_pen.handle());
+        let _ = Arc(
+            hdc,
+            handle.x - inner as i32,
+            handle.y - inner as i32,
+            handle.x + inner as i32,
+            handle.y + inner as i32,
+            handle.x + (start.cos() * inner) as i32,
+            handle.y + (start.sin() * inner) as i32,
+            handle.x + (end.cos() * inner) as i32,
+            handle.y + (end.sin() * inner) as i32,
+        );
+        SelectObject(hdc, old_pen);
+    }
+
+    let tip = POINT {
+        x: handle.x + (end.cos() * inner) as i32,
+        y: handle.y + (end.sin() * inner) as i32,
+    };
+    let tangent = end + std::f32::consts::FRAC_PI_2;
+    let head = s(4, dpi).max(3) as f32;
+    let arrow = [
+        tip,
+        POINT {
+            x: tip.x - (tangent.cos() * head + 0.5 * head * end.cos()) as i32,
+            y: tip.y - (tangent.sin() * head + 0.5 * head * end.sin()) as i32,
+        },
+        POINT {
+            x: tip.x - (tangent.cos() * head - 0.5 * head * end.cos()) as i32,
+            y: tip.y - (tangent.sin() * head - 0.5 * head * end.sin()) as i32,
+        },
+    ];
+    let brush = GdiBrush::solid(WHITE);
+    unsafe {
+        let old_brush = SelectObject(hdc, brush.handle());
+        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        let _ = Polygon(hdc, &arrow);
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+    }
+}
+
 /// Нарисовать фигуру инструментом GDI (используется и в оверлее, и в снимке).
-fn paint_shape(hdc: HDC, tool: Tool, from: POINT, to: POINT, width: i32, color: u32) {
+fn paint_shape(hdc: HDC, tool: Tool, from: POINT, to: POINT, angle: f32, width: i32, color: u32) {
     let pen = GdiPen::solid(width.max(1), color);
+    let center = rect_center(from, to);
+
     unsafe {
         let old_pen = SelectObject(hdc, pen.handle());
 
         match tool {
             Tool::Line => {
-                let _ = MoveToEx(hdc, from.x, from.y, None);
-                let _ = LineTo(hdc, to.x, to.y);
+                let a = rotate_point(from, center, angle);
+                let b = rotate_point(to, center, angle);
+                let _ = MoveToEx(hdc, a.x, a.y, None);
+                let _ = LineTo(hdc, b.x, b.y);
             }
             Tool::Arrow => {
-                draw_arrow(hdc, from, to, width, color);
+                draw_arrow(
+                    hdc,
+                    rotate_point(from, center, angle),
+                    rotate_point(to, center, angle),
+                    width,
+                    color,
+                );
             }
             Tool::Rect => {
+                let corners = shape_corners(from, to, angle);
                 let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                let _ = Rectangle(
-                    hdc,
-                    from.x.min(to.x),
-                    from.y.min(to.y),
-                    from.x.max(to.x),
-                    from.y.max(to.y),
-                );
+                let _ = Polygon(hdc, &corners);
                 SelectObject(hdc, old_brush);
             }
             Tool::Ellipse => {
-                let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                let _ = Ellipse(
-                    hdc,
-                    from.x.min(to.x),
-                    from.y.min(to.y),
-                    from.x.max(to.x),
-                    from.y.max(to.y),
-                );
-                SelectObject(hdc, old_brush);
+                let points = ellipse_points(from, to, angle, 96);
+                let _ = Polyline(hdc, &points);
             }
             _ => {}
         }
@@ -1545,7 +2074,7 @@ fn draw_tool_icon(hdc: HDC, area: &RECT, hit: ToolbarHit, color: u32, dpi: u32) 
                 x: x + w - s(1, dpi),
                 y: y + s(1, dpi),
             };
-            paint_shape(hdc, Tool::Arrow, from, to, t, color);
+            paint_shape(hdc, Tool::Arrow, from, to, 0.0, t, color);
         }
         ToolbarHit::Tool(Tool::Line) => {
             let from = POINT {
@@ -1556,7 +2085,7 @@ fn draw_tool_icon(hdc: HDC, area: &RECT, hit: ToolbarHit, color: u32, dpi: u32) 
                 x: x + w - s(2, dpi),
                 y: y + s(2, dpi),
             };
-            paint_shape(hdc, Tool::Line, from, to, t, color);
+            paint_shape(hdc, Tool::Line, from, to, 0.0, t, color);
         }
         ToolbarHit::Tool(Tool::Rect) => {
             let rect = RECT {
