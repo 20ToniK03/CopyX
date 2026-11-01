@@ -117,6 +117,7 @@ pub fn show(instance: HINSTANCE) {
         s.hot = 0;
         s.selected = None;
         s.rotating = false;
+        s.moving = false;
     });
 
     unsafe {
@@ -151,6 +152,7 @@ pub fn hide() {
         s.hot = 0;
         s.selected = None;
         s.rotating = false;
+        s.moving = false;
         s.overlay_hwnd
     });
     if hwnd.0 != 0 {
@@ -324,6 +326,7 @@ unsafe extern "system" fn overlay_proc(
                 0x1B => {
                     let deselected = app::with_state(|s| {
                         s.rotating = false;
+                        s.moving = false;
                         s.selected.take().is_some()
                     });
                     if deselected {
@@ -371,6 +374,7 @@ unsafe extern "system" fn overlay_proc(
             app::with_state(|s| {
                 s.pointer_down = false;
                 s.rotating = false;
+                s.moving = false;
             });
             LRESULT(0)
         }
@@ -381,11 +385,15 @@ unsafe extern "system" fn overlay_proc(
             let dpi = dpi_at(cursor);
             let over_toolbar = toolbar_hit(hwnd, cursor).is_some();
             let over_handle = rotation_handle_at(cursor, dpi).is_some();
+            let over_move = !over_handle && move_hit_at(cursor, dpi).is_some();
             let over_shape = !over_handle
+                && !over_move
                 && app::with_state(|s| s.tool == Tool::Select && !s.rotating)
                 && hit_annotation_at(cursor, dpi).is_some();
             let shape = if over_toolbar {
                 IDC_ARROW
+            } else if over_move {
+                IDC_SIZEALL
             } else if over_handle || over_shape {
                 IDC_HAND
             } else {
@@ -421,7 +429,21 @@ unsafe extern "system" fn overlay_proc(
                 app::with_state(|s| {
                     s.selected = Some(index);
                     s.rotating = true;
+                    s.moving = false;
                     s.pointer_down = true;
+                });
+                let _ = InvalidateRect(hwnd, None, false);
+                return LRESULT(0);
+            }
+
+            // Тянем выделенную фигуру из её тела — она остаётся активной.
+            if let Some(index) = move_hit_at(cursor, dpi) {
+                app::with_state(|s| {
+                    s.selected = Some(index);
+                    s.moving = true;
+                    s.rotating = false;
+                    s.pointer_down = true;
+                    s.move_last = cursor;
                 });
                 let _ = InvalidateRect(hwnd, None, false);
                 return LRESULT(0);
@@ -435,6 +457,7 @@ unsafe extern "system" fn overlay_proc(
                     app::with_state(|s| {
                         s.selected = Some(index);
                         s.rotating = false;
+                        s.moving = false;
                     });
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
@@ -456,6 +479,7 @@ unsafe extern "system" fn overlay_proc(
                     s.draft = Some(Draft::new(start));
                     s.selected = None;
                     s.rotating = false;
+                    s.moving = false;
                 });
                 let _ = InvalidateRect(hwnd, None, false);
                 return LRESULT(0);
@@ -474,6 +498,7 @@ unsafe extern "system" fn overlay_proc(
                 s.draft = None;
                 s.selected = None;
                 s.rotating = false;
+                s.moving = false;
                 s.capture_state = CaptureState::OverlayShown;
             });
             let _ = InvalidateRect(hwnd, None, false);
@@ -501,6 +526,21 @@ unsafe extern "system" fn overlay_proc(
                     return LRESULT(0);
                 }
                 apply_rotation(cursor);
+                let _ = InvalidateRect(hwnd, None, false);
+                return LRESULT(0);
+            }
+
+            // Перетаскиваем выделенную фигуру.
+            if app::with_state(|s| s.moving) {
+                if !message_button && !left_button_down() {
+                    app::with_state(|s| {
+                        s.moving = false;
+                        s.pointer_down = false;
+                    });
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
+                apply_move(cursor);
                 let _ = InvalidateRect(hwnd, None, false);
                 return LRESULT(0);
             }
@@ -631,6 +671,16 @@ unsafe extern "system" fn overlay_proc(
                 apply_rotation(cursor);
                 app::with_state(|s| {
                     s.rotating = false;
+                    s.pointer_down = false;
+                });
+                let _ = InvalidateRect(hwnd, None, false);
+                return LRESULT(0);
+            }
+
+            if app::with_state(|s| s.moving) {
+                apply_move(cursor);
+                app::with_state(|s| {
+                    s.moving = false;
                     s.pointer_down = false;
                 });
                 let _ = InvalidateRect(hwnd, None, false);
@@ -811,6 +861,7 @@ fn undo(hwnd: HWND) {
         }
         s.selected = None;
         s.rotating = false;
+        s.moving = false;
         s.annotations.pop().is_some()
     });
     if changed {
@@ -848,6 +899,7 @@ fn delete_selected(hwnd: HWND) {
             s.annotations.remove(index);
             s.selected = None;
             s.rotating = false;
+            s.moving = false;
             true
         }
         _ => false,
@@ -868,6 +920,7 @@ fn set_tool(hwnd: HWND, tool: Tool) {
         s.hot = 0;
         s.selected = None;
         s.rotating = false;
+        s.moving = false;
         changed
     });
     if changed {
@@ -1080,19 +1133,22 @@ fn paint_overlay(hwnd: HWND) {
 }
 
 fn paint_scene(hdc: HDC, window_rect: &RECT, client: &RECT) {
-    let (selection, hover_rect, pointer_down, has_draft, rotating) = app::with_state(|s| {
-        (
-            s.selection,
-            s.hover_rect,
-            s.pointer_down,
-            s.draft.is_some(),
-            s.rotating,
-        )
-    });
+    let (selection, hover_rect, pointer_down, has_draft, rotating, moving) =
+        app::with_state(|s| {
+            (
+                s.selection,
+                s.hover_rect,
+                s.pointer_down,
+                s.draft.is_some(),
+                s.rotating,
+                s.moving,
+            )
+        });
 
     // Пока пользователь тянет новую рамку, панель не показываем: она бы
-    // прыгала под курсором. После отпускания — показываем.
-    let dragging_selection = pointer_down && !has_draft;
+    // прыгала под курсором. После отпускания — показываем. Перетаскивание и
+    // поворот фигуры панель не прячут.
+    let dragging_selection = pointer_down && !has_draft && !moving && !rotating;
     let editing = selection.active && !dragging_selection;
 
     let has_hover = hover_rect.right - hover_rect.left > 2
@@ -1545,6 +1601,119 @@ fn rotation_handle_at(point: POINT, dpi: u32) -> Option<usize> {
             None
         }
     })
+}
+
+/// Попадание в «тело» фигуры — отсюда её можно перетаскивать целиком.
+fn hit_move(annotation: &Annotation, point: POINT, dpi: u32) -> bool {
+    let local = rotate_point(point, annotation.center(), -annotation.angle);
+    let rect = annotation.bounds();
+    let tolerance = s(8, dpi).max(6) as f32;
+
+    match annotation.tool {
+        Tool::Rect => {
+            let pad = tolerance as i32;
+            local.x >= rect.left - pad
+                && local.x <= rect.right + pad
+                && local.y >= rect.top - pad
+                && local.y <= rect.bottom + pad
+        }
+        Tool::Ellipse => {
+            let rx = (rect.right - rect.left) as f32 / 2.0 + tolerance;
+            let ry = (rect.bottom - rect.top) as f32 / 2.0 + tolerance;
+            if rx <= 0.0 || ry <= 0.0 {
+                return false;
+            }
+            let cx = (rect.left + rect.right) as f32 / 2.0;
+            let cy = (rect.top + rect.bottom) as f32 / 2.0;
+            let nx = (local.x as f32 - cx) / rx;
+            let ny = (local.y as f32 - cy) / ry;
+            nx * nx + ny * ny <= 1.0
+        }
+        Tool::Line | Tool::Arrow => {
+            let local_start = rotate_point(annotation.start, annotation.center(), -annotation.angle);
+            let local_end = rotate_point(annotation.end, annotation.center(), -annotation.angle);
+            distance_to_segment(local, local_start, local_end)
+                <= tolerance + annotation.width as f32
+        }
+        _ => false,
+    }
+}
+
+fn move_hit_at(point: POINT, dpi: u32) -> Option<usize> {
+    let selected = app::with_state(|s| s.selected)?;
+    app::with_state(|state| {
+        let annotation = state.annotations.get(selected)?;
+        if hit_move(annotation, point, dpi) {
+            Some(selected)
+        } else {
+            None
+        }
+    })
+}
+
+/// Габариты фигуры с учётом поворота — чтобы не утащить её за выделение.
+fn rotated_bounds(annotation: &Annotation) -> RECT {
+    shape_corners(annotation.start, annotation.end, annotation.angle)
+        .iter()
+        .fold(
+            RECT {
+                left: i32::MAX,
+                top: i32::MAX,
+                right: i32::MIN,
+                bottom: i32::MIN,
+            },
+            |mut acc, point| {
+                acc.left = acc.left.min(point.x);
+                acc.top = acc.top.min(point.y);
+                acc.right = acc.right.max(point.x);
+                acc.bottom = acc.bottom.max(point.y);
+                acc
+            },
+        )
+}
+
+/// Перетащить выделенную фигуру за курсором (в пределах выделения).
+fn apply_move(cursor: POINT) {
+    app::with_state(|s| {
+        let Some(index) = s.selected else {
+            return;
+        };
+        let Some(annotation) = s.annotations.get(index) else {
+            return;
+        };
+
+        let bounds = rotated_bounds(annotation);
+        let sel = app::selection_rect(&s.selection);
+        let mut dx = cursor.x - s.move_last.x;
+        let mut dy = cursor.y - s.move_last.y;
+
+        if sel.right - sel.left > 4 && sel.bottom - sel.top > 4 {
+            let lo_x = (sel.left - bounds.left).min(sel.right - bounds.right);
+            let hi_x = (sel.left - bounds.left).max(sel.right - bounds.right);
+            let lo_y = (sel.top - bounds.top).min(sel.bottom - bounds.bottom);
+            let hi_y = (sel.top - bounds.top).max(sel.bottom - bounds.bottom);
+            dx = dx.clamp(lo_x, hi_x.max(lo_x));
+            dy = dy.clamp(lo_y, hi_y.max(lo_y));
+        }
+
+        let (start, end) = (annotation.start, annotation.end);
+        if let Some(annotation) = s.annotations.get_mut(index) {
+            annotation.start = POINT {
+                x: start.x + dx,
+                y: start.y + dy,
+            };
+            annotation.end = POINT {
+                x: end.x + dx,
+                y: end.y + dy,
+            };
+        }
+        // Курсор может упереться в границу выделения — запоминаем фактический
+        // сдвиг, чтобы фигура не «отставала» от мыши потом.
+        s.move_last = POINT {
+            x: s.move_last.x + dx,
+            y: s.move_last.y + dy,
+        };
+    });
 }
 
 /// Рамка выделенной фигуры и круглая ручка поворота.

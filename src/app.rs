@@ -29,6 +29,10 @@ pub struct AppState {
     pub selected: Option<usize>,
     /// Пользователь тянет ручку поворота выделенной фигуры.
     pub rotating: bool,
+    /// Пользователь перетаскивает выделенную фигуру.
+    pub moving: bool,
+    /// Позиция курсора на предыдущем шаге перетаскивания.
+    pub move_last: POINT,
 }
 
 /// Инструменты редактора, доступные после нажатия PrtSc.
@@ -170,6 +174,8 @@ impl Default for AppState {
             hot: 0,
             selected: None,
             rotating: false,
+            moving: false,
+            move_last: POINT::default(),
         }
     }
 }
