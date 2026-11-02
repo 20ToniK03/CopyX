@@ -2,6 +2,7 @@
 
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Graphics::Gdi::HFONT;
 use copyx_core::CaptureState;
 
 use crate::render::BitmapDc;
@@ -33,6 +34,22 @@ pub struct AppState {
     pub moving: bool,
     /// Позиция курсора на предыдущем шаге перетаскивания.
     pub move_last: POINT,
+    /// Цвет линий фигур и текста (COLORREF).
+    pub color: u32,
+    /// Заливка: полупрозрачный фон у фигур и подложка под текстом.
+    pub fill: bool,
+    /// Сила размытия/пикселизации: 1–5.
+    pub intensity: i32,
+    /// Открыт ввод текста: дочерний EDIT виден и получает клавиши.
+    pub text_active: bool,
+    /// Точка, где пользователь начал вводить текст (экранные координаты).
+    pub text_origin: POINT,
+    /// DPI монитора на момент начала ввода.
+    pub text_dpi: u32,
+    /// Шрифт, которым набран текст в EDIT; освобождается при завершении.
+    pub text_font: HFONT,
+    /// Дочернее поле ввода текста.
+    pub text_edit: HWND,
 }
 
 /// Инструменты редактора, доступные после нажатия PrtSc.
@@ -45,10 +62,11 @@ pub enum Tool {
     Line,
     Rect,
     Ellipse,
+    Text,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 7] = [
+    pub const ALL: [Tool; 8] = [
         Tool::Select,
         Tool::Pixelate,
         Tool::Blur,
@@ -56,6 +74,7 @@ impl Tool {
         Tool::Line,
         Tool::Rect,
         Tool::Ellipse,
+        Tool::Text,
     ];
 
     pub fn label(self) -> &'static str {
@@ -67,6 +86,7 @@ impl Tool {
             Tool::Line => "Линия",
             Tool::Rect => "Квадрат",
             Tool::Ellipse => "Круг",
+            Tool::Text => "Текст",
         }
     }
 
@@ -90,6 +110,16 @@ pub struct Annotation {
     /// Толщина линии, уже масштабированная под DPI.
     pub width: i32,
     pub effect: Option<BitmapDc>,
+    /// Цвет контура/текста (COLORREF).
+    pub color: u32,
+    /// Полупрозрачная заливка фигуры или подложка под текстом.
+    pub fill: bool,
+    /// Текст аннотации (только для Tool::Text).
+    pub text: String,
+    /// Размер шрифта текста, уже масштабированный под DPI.
+    pub font_size: i32,
+    /// Сила эффекта 1–5 (только для Pixelate/Blur).
+    pub strength: i32,
 }
 
 impl Annotation {
@@ -176,6 +206,14 @@ impl Default for AppState {
             rotating: false,
             moving: false,
             move_last: POINT::default(),
+            color: 0x004D5AFF,
+            fill: false,
+            intensity: 3,
+            text_active: false,
+            text_origin: POINT::default(),
+            text_dpi: 96,
+            text_font: HFONT(0),
+            text_edit: HWND(0),
         }
     }
 }

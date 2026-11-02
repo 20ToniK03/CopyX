@@ -26,19 +26,23 @@ use std::time::{Duration, Instant};
 
 use windows::core::w;
 use windows::Win32::Foundation::{
-    BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::Graphics::Gdi::{
-    Arc, BitBlt, DeleteObject, Ellipse, FillRect, GetMonitorInfoW, GetStockObject,
-    IntersectClipRect, InvalidateRect, LineTo, MonitorFromPoint, MoveToEx, Polygon, Polyline,
-    RestoreDC, SaveDC, SelectObject, UpdateWindow, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    NULL_BRUSH, NULL_PEN, SRCCOPY,
+    AlphaBlend, Arc, BitBlt, CreatePolygonRgn, CreateRoundRectRgn, CreateSolidBrush,
+    DeleteObject, Ellipse, FillRect, GetMonitorInfoW, GetStockObject, IntersectClipRect,
+    InvalidateRect, LineTo, MonitorFromPoint, MoveToEx, Polygon, Polyline, RestoreDC, SaveDC,
+    SelectClipRgn, SelectObject, SetBkColor, SetTextColor, UpdateWindow, AC_SRC_OVER,
+    BLENDFUNCTION, HDC, HFONT, HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN,
+    SRCCOPY, WINDING,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::UI::Controls::{EM_SETSEL, EM_SETLIMITTEXT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // --- Палитра (COLORREF = 0x00BBGGRR) ---
@@ -54,7 +58,52 @@ const COPY_BORDER: u32 = 0x00FFE6D2; // светлая кромка акцент
 const TEXT_MAIN: u32 = 0x00FFFFFF;
 const TEXT_MUTED: u32 = 0x00D8C8B4; // RGB(180, 200, 216)
 const WHITE: u32 = 0x00FFFFFF;
-const ANNOTATION: u32 = 0x004D5AFF; // RGB(255, 90, 77) — тёплый красный
+
+/// Палитра линий и текста (COLORREF).
+const PALETTE: [u32; 9] = [
+    0x00FFFFFF, // белый
+    0x004D5AFF, // красный RGB(255, 90, 77)
+    0x003DA5FF, // оранжевый RGB(255, 165, 61)
+    0x004AD5FF, // жёлтый RGB(255, 213, 74)
+    0x0080DE4A, // зелёный RGB(74, 222, 128)
+    0x00E1E138, // голубой RGB(56, 225, 225)
+    0x00FFA95A, // синий RGB(90, 169, 255)
+    0x00FC84C0, // фиолетовый RGB(192, 132, 252)
+    0x00281E1E, // графит RGB(30, 30, 40)
+];
+
+/// Кисть фона дочернего EDIT: создаётся один раз и живёт до выхода.
+static EDIT_BG: OnceLock<isize> = OnceLock::new();
+
+fn edit_bg_brush() -> usize {
+    *EDIT_BG.get_or_init(|| unsafe { CreateSolidBrush(COLORREF(PANEL_BG)).0 }) as usize
+}
+
+/// Enter завершает ввод текста, Esc отменяет его.
+unsafe extern "system" fn edit_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    if msg == WM_KEYDOWN {
+        match wparam.0 as u32 {
+            // Enter — добавить текст, Esc — отменить ввод.
+            0x0D => {
+                let _ = PostMessageW(GetParent(hwnd), WM_TEXT_COMMIT, WPARAM(0), LPARAM(0));
+                return LRESULT(0);
+            }
+            0x1B => {
+                let _ = PostMessageW(GetParent(hwnd), WM_TEXT_CANCEL, WPARAM(0), LPARAM(0));
+                return LRESULT(0);
+            }
+            _ => {}
+        }
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
 
 /// Подсказка, пока область ещё не выделена.
 const HINT_SELECT: &str =
@@ -62,18 +111,37 @@ const HINT_SELECT: &str =
 
 /// Подсказка редактора: панель инструментов уже доступна.
 const HINT_EDIT: &str =
-    "1–7 — инструменты · Shift — ровная фигура · клик по контуру — поворот · Enter — копировать";
+    "1–8 — инструменты · Shift — ровно · C — цвет · F — заливка · [ ] — сила · Enter — копировать";
+
+/// Подсказка во время ввода текста.
+const HINT_TEXT: &str = "Введите текст · Enter — добавить · Esc — отмена";
+
+/// Сообщения от дочернего поля ввода текста.
+const WM_TEXT_COMMIT: u32 = WM_APP + 1;
+const WM_TEXT_CANCEL: u32 = WM_APP + 2;
 
 /// Кнопки панели инструментов.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ToolbarHit {
     Tool(Tool),
     Copy,
+    /// Выбор цвета линий/текста (индекс в PALETTE).
+    Color(usize),
+    /// Включить/выключить заливку.
+    Fill,
+    /// Задать силу эффекта 1–5.
+    IntensitySet(i32),
+    /// Уменьшить/увеличить силу на 1.
+    IntensityStep(i32),
 }
 
 struct ToolbarLayout {
     panel: RECT,
     buttons: Vec<(RECT, ToolbarHit)>,
+    /// Кнопки второго ряда: цвет, заливка и сила эффекта.
+    options: Vec<(RECT, ToolbarHit)>,
+    /// Подписи «Цвет» и «Сила» рядом с группами.
+    labels: Vec<(RECT, &'static str)>,
     /// Тонкая линия-разделитель перед акцентной кнопкой «Копировать».
     separator: Option<RECT>,
 }
@@ -97,6 +165,7 @@ pub fn show(instance: HINSTANCE) {
 
     // Панель от предыдущего снимка не должна попасть в новый кадр.
     toast::hide();
+    cancel_text();
 
     // Снимок делаем ДО показа окна, пока экран ничем не перекрыт.
     if let Err(e) = snapshot::capture() {
@@ -140,6 +209,7 @@ pub fn show(instance: HINSTANCE) {
 }
 
 pub fn hide() {
+    cancel_text();
     let hwnd = app::with_state(|s| {
         s.capture_state = CaptureState::Idle;
         s.selection = Selection::default();
@@ -197,7 +267,28 @@ fn create_overlay(instance: HINSTANCE) {
             None,
         );
 
-        app::with_state(|s| s.overlay_hwnd = hwnd);
+        // Поле ввода текста — обычный EDIT, скрытый до выбора инструмента «Текст».
+        let edit = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("EDIT"),
+            w!(""),
+            WS_CHILD | WINDOW_STYLE((ES_LEFT | ES_AUTOHSCROLL | ES_NOHIDESEL) as u32),
+            0,
+            0,
+            0,
+            0,
+            hwnd,
+            HMENU::default(),
+            instance,
+            None,
+        );
+        let _ = SetWindowSubclass(edit, Some(edit_subclass), 1, 0);
+        let _ = SendMessageW(edit, EM_SETLIMITTEXT, WPARAM(512), LPARAM(0));
+
+        app::with_state(|s| {
+            s.overlay_hwnd = hwnd;
+            s.text_edit = edit;
+        });
     }
 }
 
@@ -324,6 +415,11 @@ unsafe extern "system" fn overlay_proc(
             match key {
                 // Esc — снять выделение с фигуры, иначе закрыть оверлей.
                 0x1B => {
+                    if app::with_state(|s| s.text_active) {
+                        cancel_text();
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
                     let deselected = app::with_state(|s| {
                         s.rotating = false;
                         s.moving = false;
@@ -339,6 +435,11 @@ unsafe extern "system" fn overlay_proc(
                 0x2E | 0x08 => delete_selected(hwnd),
                 // Enter — скопировать текущее выделение (или окно под курсором).
                 0x0D => {
+                    if app::with_state(|s| s.text_active) {
+                        commit_text();
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
                     if let Some(target) = current_target() {
                         finish_capture(target);
                     }
@@ -351,15 +452,44 @@ unsafe extern "system" fn overlay_proc(
                         finish_capture(target);
                     }
                 }
+                // C без Ctrl — следующий цвет из палитры.
+                0x43 => cycle_color(hwnd),
+                // F — включить/выключить заливку.
+                0x46 => toggle_fill(hwnd),
+                // [ и ] — сила размытия/пикселизации.
+                0xDB => change_intensity(hwnd, -1),
+                0xDD => change_intensity(hwnd, 1),
                 // Ctrl+Z — отменить последнюю аннотацию.
                 0x5A if ctrl => undo(hwnd),
-                // 1–7 — выбор инструмента (Ctrl+1…7 тоже работает).
-                0x31..=0x37 => {
+                // 1–8 — выбор инструмента (Ctrl+1…8 тоже работает).
+                0x31..=0x38 => {
                     let tool = Tool::ALL[(key - 0x31) as usize];
                     set_tool(hwnd, tool);
                 }
                 _ => {}
             }
+            LRESULT(0)
+        }
+
+        // Тёмное поле ввода текста в стиле стеклянной панели.
+        WM_CTLCOLOREDIT => {
+            let hdc = HDC(wparam.0 as isize);
+            unsafe {
+                let _ = SetTextColor(hdc, COLORREF(WHITE));
+                let _ = SetBkColor(hdc, COLORREF(PANEL_BG));
+            }
+            LRESULT(edit_bg_brush() as isize)
+        }
+
+        WM_TEXT_COMMIT => {
+            commit_text();
+            let _ = InvalidateRect(hwnd, None, false);
+            LRESULT(0)
+        }
+
+        WM_TEXT_CANCEL => {
+            cancel_text();
+            let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
 
@@ -389,7 +519,8 @@ unsafe extern "system" fn overlay_proc(
             let over_shape = !over_handle
                 && !over_move
                 && app::with_state(|s| s.tool == Tool::Select && !s.rotating)
-                && hit_annotation_at(cursor, dpi).is_some();
+                && (hit_annotation_at(cursor, dpi).is_some()
+                    || hit_interior_at(cursor).is_some());
             let shape = if over_toolbar {
                 IDC_ARROW
             } else if over_move {
@@ -409,6 +540,13 @@ unsafe extern "system" fn overlay_proc(
             let mut cursor = POINT::default();
             let _ = GetCursorPos(&mut cursor);
 
+            // Клик мимо поля ввода завершает текст, а уже потом обрабатывается
+            // как обычное нажатие (в том числе по панели).
+            let was_editing = app::with_state(|s| s.text_active);
+            if was_editing {
+                commit_text();
+            }
+
             // Клик по панели инструментов не начинает выделение.
             if let Some(hit) = toolbar_hit(hwnd, cursor) {
                 match hit {
@@ -418,7 +556,20 @@ unsafe extern "system" fn overlay_proc(
                             finish_capture(target);
                         }
                     }
+                    ToolbarHit::Color(index) => set_color(hwnd, index),
+                    ToolbarHit::Fill => toggle_fill(hwnd),
+                    ToolbarHit::IntensitySet(value) => set_intensity(hwnd, value, cursor),
+                    ToolbarHit::IntensityStep(delta) => {
+                        let value = app::with_state(|s| s.intensity) + delta;
+                        set_intensity(hwnd, value, cursor);
+                    }
                 }
+                return LRESULT(0);
+            }
+
+            // Клик, завершивший ввод текста, не должен сразу открывать новый.
+            if was_editing {
+                let _ = InvalidateRect(hwnd, None, false);
                 return LRESULT(0);
             }
 
@@ -451,14 +602,13 @@ unsafe extern "system" fn overlay_proc(
 
             let (selection, tool) = app::with_state(|s| (s.selection, s.tool));
 
-            // Инструмент «Область»: клик по контуру выбирает фигуру для поворота.
+            // Инструмент «Область»: текст и эффекты выбираются кликом внутри,
+            // фигуры — по контуру.
             if tool == Tool::Select {
-                if let Some(index) = hit_annotation_at(cursor, dpi) {
-                    app::with_state(|s| {
-                        s.selected = Some(index);
-                        s.rotating = false;
-                        s.moving = false;
-                    });
+                if let Some(index) =
+                    hit_interior_at(cursor).or_else(|| hit_annotation_at(cursor, dpi))
+                {
+                    select_annotation(index);
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
@@ -469,6 +619,18 @@ unsafe extern "system" fn overlay_proc(
                 && sel_rect.right - sel_rect.left > 4
                 && sel_rect.bottom - sel_rect.top > 4
                 && point_in_rect(cursor, &sel_rect);
+
+            // «Текст»: клик внутри области открывает поле ввода в этой точке.
+            if inside_selection && tool == Tool::Text {
+                start_text(hwnd, clamp_point(cursor, &sel_rect), &sel_rect, dpi);
+                return LRESULT(0);
+            }
+
+            // «Область»: клик по пустому месту внутри выделения ничего не
+            // меняет — иначе случайное нажатие стёрло бы все аннотации.
+            if inside_selection && tool == Tool::Select {
+                return LRESULT(0);
+            }
 
             if inside_selection && tool != Tool::Select {
                 // Рисуем аннотацию внутри уже выбранной области.
@@ -594,7 +756,7 @@ unsafe extern "system" fn overlay_proc(
                                     && area <= 900_000
                                 {
                                     draft.preview_at = Some(Instant::now());
-                                    request = Some((tool, rect));
+                                    request = Some((tool, rect, s.intensity));
                                 }
                             }
                         }
@@ -602,8 +764,8 @@ unsafe extern "system" fn overlay_proc(
                         (request, moved)
                     });
 
-                    if let Some((tool, rect)) = preview_request {
-                        let preview = make_effect(tool, &rect, dpi);
+                    if let Some((tool, rect, strength)) = preview_request {
+                        let preview = make_effect(tool, &rect, dpi, strength);
                         app::with_state(|s| {
                             if let Some(draft) = s.draft.as_mut() {
                                 draft.preview = preview;
@@ -723,8 +885,11 @@ unsafe extern "system" fn overlay_proc(
                     };
 
                     if big_enough && tool.is_effect() {
-                        if let Some(effect) = make_effect(tool, &rect, dpi) {
+                        let strength = app::with_state(|s| s.intensity);
+                        if let Some(effect) = make_effect(tool, &rect, dpi, strength) {
                             app::with_state(|state| {
+                                let color = state.color;
+                                let fill = state.fill;
                                 state.annotations.push(Annotation {
                                     tool,
                                     start: POINT {
@@ -738,6 +903,11 @@ unsafe extern "system" fn overlay_proc(
                                     angle: 0.0,
                                     width: 0,
                                     effect: Some(effect),
+                                    color,
+                                    fill,
+                                    text: String::new(),
+                                    font_size: 0,
+                                    strength,
                                 });
                                 state.selected = None;
                             });
@@ -745,6 +915,8 @@ unsafe extern "system" fn overlay_proc(
                     } else if big_enough && tool.is_shape() {
                         let stroke = s(3, dpi).max(2);
                         app::with_state(|state| {
+                            let color = state.color;
+                            let fill = state.fill;
                             state.annotations.push(Annotation {
                                 tool,
                                 start: draft.start,
@@ -752,6 +924,11 @@ unsafe extern "system" fn overlay_proc(
                                 angle: 0.0,
                                 width: stroke,
                                 effect: None,
+                                color,
+                                fill,
+                                text: String::new(),
+                                font_size: 0,
+                                strength: 0,
                             });
                             // Свежая фигура сразу выделена — ручка поворота рядом.
                             state.selected = Some(state.annotations.len() - 1);
@@ -1020,15 +1197,44 @@ fn compose(
             }
         }
 
+        if annotation.tool == Tool::Text {
+            paint_text(
+                canvas.handle(),
+                offset_point(annotation.start, target),
+                offset_point(annotation.end, target),
+                &annotation.text,
+                annotation.font_size,
+                annotation.color,
+                annotation.fill,
+                dpi_at(POINT {
+                    x: annotation.start.x,
+                    y: annotation.start.y,
+                }),
+            );
+            continue;
+        }
+
         if annotation.tool.is_shape() {
+            let from = offset_point(annotation.start, target);
+            let to = offset_point(annotation.end, target);
+            if annotation.fill {
+                paint_shape_fill(
+                    canvas.handle(),
+                    annotation.tool,
+                    from,
+                    to,
+                    annotation.angle,
+                    annotation.color,
+                );
+            }
             paint_shape(
                 canvas.handle(),
                 annotation.tool,
-                offset_point(annotation.start, target),
-                offset_point(annotation.end, target),
+                from,
+                to,
                 annotation.angle,
                 annotation.width,
-                ANNOTATION,
+                annotation.color,
             );
         }
     }
@@ -1042,13 +1248,295 @@ fn compose(
     })
 }
 
-fn make_effect(tool: Tool, rect: &RECT, dpi: u32) -> Option<BitmapDc> {
+fn make_effect(tool: Tool, rect: &RECT, dpi: u32, strength: i32) -> Option<BitmapDc> {
+    let level = strength.clamp(1, 5);
+    let block = match level {
+        1 => 6,
+        2 => 9,
+        3 => 13,
+        4 => 18,
+        _ => 24,
+    };
+    let radius = match level {
+        1 => 3,
+        2 => 5,
+        3 => 8,
+        4 => 12,
+        _ => 18,
+    };
     snapshot::with_current(|snap| match tool {
-        Tool::Pixelate => snap.pixelate_bitmap(rect, s(10, dpi).clamp(6, 24)),
-        Tool::Blur => snap.blur_bitmap(rect, s(8, dpi).clamp(4, 16)),
+        Tool::Pixelate => snap.pixelate_bitmap(rect, s(block, dpi).max(3)),
+        Tool::Blur => snap.blur_bitmap(rect, s(radius, dpi).max(2)),
         _ => None,
     })
     .flatten()
+}
+
+// ---------------------------------------------------------------------------
+// Стиль, текст и выбор аннотаций
+// ---------------------------------------------------------------------------
+
+fn style_applies(tool: Tool) -> bool {
+    tool.is_shape() || tool == Tool::Text
+}
+
+/// Выбрать аннотацию и подтянуть панель к её текущему стилю.
+fn select_annotation(index: usize) {
+    app::with_state(|s| {
+        let style = s.annotations.get(index).map(|a| {
+            (
+                style_applies(a.tool),
+                a.color,
+                a.fill,
+                a.tool.is_effect(),
+                a.strength,
+            )
+        });
+        if let Some((styled, color, fill, effect, strength)) = style {
+            if styled {
+                s.color = color;
+                s.fill = fill;
+            }
+            if effect {
+                s.intensity = strength;
+            }
+        }
+        s.selected = Some(index);
+        s.rotating = false;
+        s.moving = false;
+    });
+}
+
+fn set_color(hwnd: HWND, index: usize) {
+    let Some(&color) = PALETTE.get(index) else {
+        return;
+    };
+    app::with_state(|s| {
+        s.color = color;
+        if let Some(annotation) = s.selected.and_then(|i| s.annotations.get_mut(i)) {
+            if style_applies(annotation.tool) {
+                annotation.color = color;
+            }
+        }
+    });
+    let _ = unsafe { InvalidateRect(hwnd, None, false) };
+}
+
+fn cycle_color(hwnd: HWND) {
+    let index = app::with_state(|s| {
+        PALETTE
+            .iter()
+            .position(|color| *color == s.color)
+            .unwrap_or(0)
+    });
+    set_color(hwnd, (index + 1) % PALETTE.len());
+}
+
+fn toggle_fill(hwnd: HWND) {
+    app::with_state(|s| {
+        let fill = !s.fill;
+        s.fill = fill;
+        if let Some(annotation) = s.selected.and_then(|i| s.annotations.get_mut(i)) {
+            if style_applies(annotation.tool) {
+                annotation.fill = fill;
+            }
+        }
+    });
+    let _ = unsafe { InvalidateRect(hwnd, None, false) };
+}
+
+/// Поменять силу эффекта. Если выделен готовый эффект — сразу пересобрать его.
+fn set_intensity(hwnd: HWND, value: i32, cursor: POINT) {
+    let value = value.clamp(1, 5);
+    let target = app::with_state(|s| {
+        s.intensity = value;
+        s.selected.and_then(|index| {
+            s.annotations.get(index).and_then(|annotation| {
+                if annotation.tool.is_effect() {
+                    Some((
+                        index,
+                        annotation.tool,
+                        normalized(annotation.start, annotation.end),
+                    ))
+                } else {
+                    None
+                }
+            })
+        })
+    });
+
+    if let Some((index, tool, rect)) = target {
+        let effect = make_effect(tool, &rect, dpi_at(cursor), value);
+        app::with_state(|s| {
+            if let Some(annotation) = s.annotations.get_mut(index) {
+                annotation.strength = value;
+                if let Some(effect) = effect {
+                    annotation.effect = Some(effect);
+                }
+            }
+        });
+    }
+
+    let _ = unsafe { InvalidateRect(hwnd, None, false) };
+}
+
+fn change_intensity(hwnd: HWND, delta: i32) {
+    let mut cursor = POINT::default();
+    let _ = unsafe { GetCursorPos(&mut cursor) };
+    let value = app::with_state(|s| s.intensity) + delta;
+    set_intensity(hwnd, value, cursor);
+}
+
+/// Открыть поле ввода текста в точке `origin` (экранные координаты).
+fn start_text(hwnd: HWND, origin: POINT, selection: &RECT, dpi: u32) {
+    cancel_text();
+    let edit = app::with_state(|s| s.text_edit);
+    if edit.0 == 0 {
+        return;
+    }
+
+    let font = ui::make_font(s(24, dpi), 600);
+    let max_width = (selection.right - origin.x - s(8, dpi)).max(s(80, dpi));
+    let width = max_width.min(s(360, dpi));
+    let height = s(32, dpi);
+
+    let mut window = RECT::default();
+    let _ = unsafe { GetWindowRect(hwnd, &mut window) };
+    let local_x = origin.x - window.left;
+    let local_y = origin.y - window.top;
+
+    unsafe {
+        let _ = SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        let _ = SetWindowTextW(edit, w!(""));
+        let _ = SetWindowPos(
+            edit,
+            HWND_TOP,
+            local_x,
+            local_y,
+            width,
+            height,
+            SWP_SHOWWINDOW,
+        );
+        let _ = SendMessageW(edit, EM_SETSEL, WPARAM(0), LPARAM(0));
+        let _ = SetFocus(edit);
+    }
+
+    app::with_state(|s| {
+        s.text_active = true;
+        s.text_origin = origin;
+        s.text_dpi = dpi;
+        s.text_font = font;
+        s.selected = None;
+        s.rotating = false;
+        s.moving = false;
+        s.draft = None;
+    });
+    let _ = unsafe { InvalidateRect(hwnd, None, false) };
+}
+
+/// Завершить ввод текста и превратить его в аннотацию.
+fn commit_text() {
+    let (active, edit, font, origin, dpi, color, fill, selection, hwnd) = app::with_state(|s| {
+        (
+            s.text_active,
+            s.text_edit,
+            s.text_font,
+            s.text_origin,
+            s.text_dpi,
+            s.color,
+            s.fill,
+            s.selection,
+            s.overlay_hwnd,
+        )
+    });
+    if !active || edit.0 == 0 {
+        return;
+    }
+
+    let length = unsafe { GetWindowTextLengthW(edit) };
+    let mut buffer = vec![0u16; length as usize + 1];
+    let copied = unsafe { GetWindowTextW(edit, &mut buffer) };
+    let text = String::from_utf16_lossy(&buffer[..copied as usize]);
+    let text = text.trim().to_string();
+
+    let font_size = s(24, dpi);
+    let measured = if text.is_empty() {
+        SIZE::default()
+    } else {
+        let screen = ScreenDc::for_screen();
+        ui::measure_text(screen.handle(), &text, font)
+    };
+
+    unsafe {
+        let _ = ShowWindow(edit, SW_HIDE);
+        if font.0 != 0 {
+            let _ = DeleteObject(font);
+        }
+        if hwnd.0 != 0 {
+            let _ = SetFocus(hwnd);
+        }
+    }
+    app::with_state(|s| {
+        s.text_active = false;
+        s.text_font = HFONT(0);
+    });
+
+    if text.is_empty() {
+        return;
+    }
+
+    let pad = s(6, dpi);
+    let width = measured.cx + pad * 2;
+    let height = measured.cy + pad * 2;
+    let sel_rect = app::selection_rect(&selection);
+    let max_x = (sel_rect.right - width).max(sel_rect.left);
+    let max_y = (sel_rect.bottom - height).max(sel_rect.top);
+    let start = POINT {
+        x: origin.x.clamp(sel_rect.left, max_x),
+        y: origin.y.clamp(sel_rect.top, max_y),
+    };
+    let end = POINT {
+        x: start.x + width,
+        y: start.y + height,
+    };
+
+    app::with_state(|s| {
+        s.annotations.push(Annotation {
+            tool: Tool::Text,
+            start,
+            end,
+            angle: 0.0,
+            width: 0,
+            effect: None,
+            color,
+            fill,
+            text,
+            font_size,
+            strength: 0,
+        });
+        s.selected = Some(s.annotations.len() - 1);
+        s.rotating = false;
+        s.moving = false;
+    });
+}
+
+/// Скрыть поле ввода и освободить его шрифт (текст при этом не добавляется).
+fn cancel_text() {
+    let (active, edit, font, hwnd) =
+        app::with_state(|s| (s.text_active, s.text_edit, s.text_font, s.overlay_hwnd));
+    if edit.0 != 0 {
+        let _ = unsafe { ShowWindow(edit, SW_HIDE) };
+    }
+    if font.0 != 0 {
+        let _ = unsafe { DeleteObject(font) };
+    }
+    app::with_state(|s| {
+        s.text_active = false;
+        s.text_font = HFONT(0);
+    });
+    if active && hwnd.0 != 0 {
+        let _ = unsafe { SetFocus(hwnd) };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,7 +1621,7 @@ fn paint_overlay(hwnd: HWND) {
 }
 
 fn paint_scene(hdc: HDC, window_rect: &RECT, client: &RECT) {
-    let (selection, hover_rect, pointer_down, has_draft, rotating, moving) =
+    let (selection, hover_rect, pointer_down, has_draft, rotating, moving, text_active) =
         app::with_state(|s| {
             (
                 s.selection,
@@ -1142,6 +1630,7 @@ fn paint_scene(hdc: HDC, window_rect: &RECT, client: &RECT) {
                 s.draft.is_some(),
                 s.rotating,
                 s.moving,
+                s.text_active,
             )
         });
 
@@ -1200,6 +1689,8 @@ fn paint_scene(hdc: HDC, window_rect: &RECT, client: &RECT) {
                     &s.annotations,
                     s.draft.as_ref(),
                     s.tool,
+                    s.color,
+                    s.fill,
                     dpi,
                 );
                 let _ = RestoreDC(hdc, saved);
@@ -1247,7 +1738,13 @@ fn paint_scene(hdc: HDC, window_rect: &RECT, client: &RECT) {
     }
 
     // Подсказка сверху по центру монитора, на котором находится курсор.
-    let hint = if editing { HINT_EDIT } else { HINT_SELECT };
+    let hint = if text_active {
+        HINT_TEXT
+    } else if editing {
+        HINT_EDIT
+    } else {
+        HINT_SELECT
+    };
     let monitor = monitor_local_rect(cursor_screen, window_rect);
     let hint_size = measure_chip(hdc, hint, s(13, dpi), dpi);
     let hint_x = (monitor.left + monitor.right - hint_size.cx) / 2;
@@ -1288,6 +1785,8 @@ fn paint_annotations(
     annotations: &[Annotation],
     draft: Option<&Draft>,
     tool: Tool,
+    color: u32,
+    fill: bool,
     dpi: u32,
 ) {
     for annotation in annotations {
@@ -1317,15 +1816,34 @@ fn paint_annotations(
             continue;
         }
 
+        if annotation.tool == Tool::Text {
+            paint_text(
+                hdc,
+                screen_to_local_point(annotation.start, window),
+                screen_to_local_point(annotation.end, window),
+                &annotation.text,
+                annotation.font_size,
+                annotation.color,
+                annotation.fill,
+                dpi,
+            );
+            continue;
+        }
+
         if annotation.tool.is_shape() {
+            let from = screen_to_local_point(annotation.start, window);
+            let to = screen_to_local_point(annotation.end, window);
+            if annotation.fill {
+                paint_shape_fill(hdc, annotation.tool, from, to, annotation.angle, annotation.color);
+            }
             paint_shape(
                 hdc,
                 annotation.tool,
-                screen_to_local_point(annotation.start, window),
-                screen_to_local_point(annotation.end, window),
+                from,
+                to,
                 annotation.angle,
                 annotation.width,
-                ANNOTATION,
+                annotation.color,
             );
         }
     }
@@ -1362,14 +1880,19 @@ fn paint_annotations(
             ui::stroke_rect(hdc, &local, s(2, dpi).max(2), ACCENT);
         }
     } else if tool.is_shape() {
+        let from = screen_to_local_point(draft.start, window);
+        let to = screen_to_local_point(draft.end, window);
+        if fill {
+            paint_shape_fill(hdc, tool, from, to, 0.0, color);
+        }
         paint_shape(
             hdc,
             tool,
-            screen_to_local_point(draft.start, window),
-            screen_to_local_point(draft.end, window),
+            from,
+            to,
             0.0,
             s(3, dpi).max(2),
-            ANNOTATION,
+            color,
         );
     }
 }
@@ -1579,6 +2102,26 @@ fn hit_annotation_at(point: POINT, dpi: u32) -> Option<usize> {
     app::with_state(|s| hit_annotation(&s.annotations, point, dpi))
 }
 
+/// Аннотации, которые выбираются кликом внутри: текст и эффекты.
+fn hit_interior_at(point: POINT) -> Option<usize> {
+    app::with_state(|s| {
+        s.annotations
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, annotation)| match annotation.tool {
+                Tool::Text | Tool::Pixelate | Tool::Blur => {
+                    if point_in_rect(point, &annotation.bounds()) {
+                        Some(index)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+    })
+}
+
 /// Центр ручки поворота: над верхней стороной фигуры, с учётом её поворота.
 fn rotate_handle_center(annotation: &Annotation, dpi: u32) -> POINT {
     let rect = annotation.bounds();
@@ -1593,6 +2136,10 @@ fn rotation_handle_at(point: POINT, dpi: u32) -> Option<usize> {
     let selected = app::with_state(|s| s.selected)?;
     app::with_state(|state| {
         let annotation = state.annotations.get(selected)?;
+        // Текст и эффекты не вращаются — у них нет ручки.
+        if !annotation.tool.is_shape() {
+            return None;
+        }
         let handle = rotate_handle_center(annotation, dpi);
         let radius = s(12, dpi).max(8);
         if (point.x - handle.x).abs() <= radius && (point.y - handle.y).abs() <= radius {
@@ -1634,6 +2181,13 @@ fn hit_move(annotation: &Annotation, point: POINT, dpi: u32) -> bool {
             let local_end = rotate_point(annotation.end, annotation.center(), -annotation.angle);
             distance_to_segment(local, local_start, local_end)
                 <= tolerance + annotation.width as f32
+        }
+        Tool::Text => {
+            let pad = tolerance as i32;
+            local.x >= rect.left - pad
+                && local.x <= rect.right + pad
+                && local.y >= rect.top - pad
+                && local.y <= rect.bottom + pad
         }
         _ => false,
     }
@@ -1746,6 +2300,11 @@ fn draw_annotation_selection(
         SelectObject(hdc, old_pen);
     }
 
+    // Текст и эффекты не вращаются: показываем только рамку.
+    if !annotation.tool.is_shape() {
+        return;
+    }
+
     // Поводок от верхней стороны рамки к ручке.
     let anchor = POINT {
         x: (rect.left + rect.right) / 2,
@@ -1827,6 +2386,131 @@ fn draw_annotation_selection(
         SelectObject(hdc, old_pen);
         SelectObject(hdc, old_brush);
     }
+}
+
+/// Полупрозрачная заливка внутри контура фигуры.
+fn paint_shape_fill(hdc: HDC, tool: Tool, from: POINT, to: POINT, angle: f32, color: u32) {
+    let points: Vec<POINT> = match tool {
+        Tool::Rect => shape_corners(from, to, angle).to_vec(),
+        Tool::Ellipse => ellipse_points(from, to, angle, 96),
+        _ => return,
+    };
+    if points.len() < 3 {
+        return;
+    }
+    let region = unsafe { CreatePolygonRgn(&points, WINDING) };
+    if region.is_invalid() {
+        return;
+    }
+    let bounds = bounds_of(&points);
+    fill_region(hdc, region, &bounds, color, 70);
+}
+
+/// Подложка под текстом — тёмное полупрозрачное стекло.
+fn paint_text(
+    hdc: HDC,
+    from: POINT,
+    to: POINT,
+    text: &str,
+    font_size: i32,
+    color: u32,
+    fill: bool,
+    dpi: u32,
+) {
+    let rect = normalized(from, to);
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width < 2 || height < 2 || text.is_empty() {
+        return;
+    }
+
+    if fill {
+        let radius = s(4, dpi).max(2);
+        let region = unsafe {
+            CreateRoundRectRgn(
+                rect.left,
+                rect.top,
+                rect.right + 1,
+                rect.bottom + 1,
+                radius * 2,
+                radius * 2,
+            )
+        };
+        if !region.is_invalid() {
+            fill_region(hdc, region, &rect, PANEL_BG, 190);
+        }
+    }
+
+    let font = ui::make_font(font_size.max(8), 600);
+    let size = ui::measure_text(hdc, text, font);
+    let x = rect.left + (width - size.cx) / 2;
+    let y = rect.top + (height - size.cy) / 2;
+    ui::draw_text(hdc, x, y, text, font, color);
+    unsafe {
+        let _ = DeleteObject(font);
+    }
+}
+
+/// Залить область, ограниченную регионом, цветом с прозрачностью.
+fn fill_region(hdc: HDC, region: HRGN, bounds: &RECT, color: u32, alpha: u8) {
+    let width = bounds.right - bounds.left;
+    let height = bounds.bottom - bounds.top;
+    if width < 1 || height < 1 {
+        let _ = unsafe { DeleteObject(region) };
+        return;
+    }
+
+    let blue = ((color >> 16) & 0xFF) as u8;
+    let green = ((color >> 8) & 0xFF) as u8;
+    let red = (color & 0xFF) as u8;
+    let Some(source) = BitmapDc::from_bgra(hdc, 1, 1, &[blue, green, red, 255]) else {
+        let _ = unsafe { DeleteObject(region) };
+        return;
+    };
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: alpha,
+        AlphaFormat: 0,
+    };
+
+    unsafe {
+        let saved = SaveDC(hdc);
+        let _ = SelectClipRgn(hdc, region);
+        let _ = AlphaBlend(
+            hdc,
+            bounds.left,
+            bounds.top,
+            width,
+            height,
+            source.handle(),
+            0,
+            0,
+            1,
+            1,
+            blend,
+        );
+        let _ = RestoreDC(hdc, saved);
+        let _ = DeleteObject(region);
+    }
+}
+
+fn bounds_of(points: &[POINT]) -> RECT {
+    points.iter().fold(
+        RECT {
+            left: i32::MAX,
+            top: i32::MAX,
+            right: i32::MIN,
+            bottom: i32::MIN,
+        },
+        |mut acc, point| {
+            acc.left = acc.left.min(point.x);
+            acc.top = acc.top.min(point.y);
+            acc.right = acc.right.max(point.x);
+            acc.bottom = acc.bottom.max(point.y);
+            acc
+        },
+    )
 }
 
 /// Нарисовать фигуру инструментом GDI (используется и в оверлее, и в снимке).
@@ -1918,14 +2602,19 @@ fn toolbar_layout(
     dpi: u32,
 ) -> ToolbarLayout {
     let font = ui::make_font(s(12, dpi), 600);
+    let label_font = ui::make_font(s(11, dpi), 600);
     let pad_x = s(9, dpi);
     let pad = s(7, dpi);
     let gap = s(5, dpi);
     let btn_h = s(34, dpi);
+    let opt_h = s(26, dpi);
+    let opt_btn_h = s(22, dpi);
+    let row_gap = s(7, dpi);
     let icon = s(15, dpi);
     let icon_gap = s(5, dpi);
     let sep_w = s(13, dpi);
 
+    // --- Первый ряд: инструменты и «Копировать» ---
     let mut specs: Vec<(&str, ToolbarHit)> = Tool::ALL
         .iter()
         .map(|tool| (tool.label(), ToolbarHit::Tool(*tool)))
@@ -1933,19 +2622,51 @@ fn toolbar_layout(
     specs.push(("Копировать", ToolbarHit::Copy));
 
     let mut widths = Vec::with_capacity(specs.len());
-    let mut content_w = 0;
+    let mut tools_w = 0;
     for (label, _) in &specs {
         let width = ui::measure_text(hdc, label, font).cx + pad_x * 2 + icon + icon_gap;
         widths.push(width);
-        content_w += width;
+        tools_w += width;
     }
-    content_w += gap * (specs.len() as i32 - 1) + sep_w;
+    tools_w += gap * (specs.len() as i32 - 1) + sep_w;
 
-    let panel_w = content_w + pad * 2;
-    let panel_h = btn_h + pad * 2;
+    // --- Второй ряд: цвет, заливка, сила эффекта ---
+    let swatch = s(20, dpi);
+    let swatch_gap = s(4, dpi);
+    let group_gap = s(14, dpi);
+    let label_gap = s(6, dpi);
+    let step_w = s(22, dpi);
+    let pip_w = s(12, dpi);
+    let pip_gap = s(4, dpi);
+
+    let color_label_w = ui::measure_text(hdc, "Цвет", label_font).cx;
+    let strength_label_w = ui::measure_text(hdc, "Сила", label_font).cx;
+    let fill_text_w = ui::measure_text(hdc, "Заливка", label_font).cx;
+    let fill_w = fill_text_w + s(26, dpi) + pad_x;
+
+    let mut options_w = color_label_w
+        + label_gap
+        + PALETTE.len() as i32 * swatch
+        + (PALETTE.len() as i32 - 1) * swatch_gap
+        + group_gap
+        + fill_w
+        + group_gap
+        + strength_label_w
+        + label_gap
+        + step_w
+        + pip_gap
+        + 5 * pip_w
+        + 4 * pip_gap
+        + pip_gap
+        + step_w;
+
+    let panel_w = tools_w.max(options_w) + pad * 2;
+    let panel_h = pad * 2 + btn_h + row_gap + opt_h;
+    options_w = options_w.min(panel_w - pad * 2);
 
     unsafe {
         let _ = DeleteObject(font);
+        let _ = DeleteObject(label_font);
     }
 
     let monitor = monitor_local_rect(cursor_screen, window);
@@ -2010,11 +2731,140 @@ fn toolbar_layout(
         x += width + gap;
     }
 
-    ToolbarLayout {
+    // --- Раскладка второго ряда по центру панели ---
+    let options_top = top + pad + btn_h + row_gap;
+    let opt_y = options_top + (opt_h - opt_btn_h) / 2;
+    let mut x = left + (panel_w - options_w) / 2;
+    let mut options = Vec::new();
+    let mut labels = Vec::new();
+    let label_h = s(14, dpi);
+    let label_y = options_top + (opt_h - label_h) / 2;
+
+    labels.push((
+        RECT {
+            left: x,
+            top: label_y,
+            right: x + color_label_w,
+            bottom: label_y + label_h,
+        },
+        "Цвет",
+    ));
+    x += color_label_w + label_gap;
+
+    for (index, _) in PALETTE.iter().enumerate() {
+        let rect = RECT {
+            left: x,
+            top: opt_y,
+            right: x + swatch,
+            bottom: opt_y + opt_btn_h,
+        };
+        options.push((rect, ToolbarHit::Color(index)));
+        x += swatch + swatch_gap;
+    }
+    x += group_gap - swatch_gap;
+
+    let fill_rect = RECT {
+        left: x,
+        top: opt_y,
+        right: x + fill_w,
+        bottom: opt_y + opt_btn_h,
+    };
+    options.push((fill_rect, ToolbarHit::Fill));
+    x += fill_w + group_gap;
+
+    labels.push((
+        RECT {
+            left: x,
+            top: label_y,
+            right: x + strength_label_w,
+            bottom: label_y + label_h,
+        },
+        "Сила",
+    ));
+    x += strength_label_w + label_gap;
+
+    let minus = RECT {
+        left: x,
+        top: opt_y,
+        right: x + step_w,
+        bottom: opt_y + opt_btn_h,
+    };
+    options.push((minus, ToolbarHit::IntensityStep(-1)));
+    x += step_w + pip_gap;
+
+    for level in 1..=5 {
+        let rect = RECT {
+            left: x,
+            top: opt_y,
+            right: x + pip_w,
+            bottom: opt_y + opt_btn_h,
+        };
+        options.push((rect, ToolbarHit::IntensitySet(level)));
+        x += pip_w + pip_gap;
+    }
+
+    let plus = RECT {
+        left: x,
+        top: opt_y,
+        right: x + step_w,
+        bottom: opt_y + opt_btn_h,
+    };
+    options.push((plus, ToolbarHit::IntensityStep(1)));
+
+    let layout = ToolbarLayout {
         panel,
         buttons,
+        options,
+        labels,
         separator,
+    };
+    dump_layout(&layout);
+    layout
+}
+
+/// Диагностика раскладки для автотестов (включается переменной окружения).
+fn dump_layout(layout: &ToolbarLayout) {
+    if std::env::var("COPYX_DUMP_LAYOUT").is_err() {
+        return;
     }
+    let mut text = String::new();
+    let mut add = |name: String, rect: &RECT| {
+        text.push_str(&format!(
+            "{} {} {} {} {}\n",
+            name, rect.left, rect.top, rect.right, rect.bottom
+        ));
+    };
+    add("panel".to_string(), &layout.panel);
+    for (rect, hit) in &layout.buttons {
+        add(format!("{:?}", hit), rect);
+    }
+    for (rect, hit) in &layout.options {
+        add(format!("{:?}", hit), rect);
+    }
+    let path = std::env::temp_dir().join("copyx_layout.txt");
+    let mut text = text;
+    app::with_state(|s| {
+        for (index, annotation) in s.annotations.iter().enumerate() {
+            text.push_str(&format!(
+                "ann#{} {:?} fill={} color={:06X} strength={} text={:?} rect={} {} {} {}\n",
+                index,
+                annotation.tool,
+                annotation.fill,
+                annotation.color,
+                annotation.strength,
+                annotation.text,
+                annotation.start.x,
+                annotation.start.y,
+                annotation.end.x,
+                annotation.end.y
+            ));
+        }
+        text.push_str(&format!(
+            "state fill={} color={:06X} intensity={} selected={:?}\n",
+            s.fill, s.color, s.intensity, s.selected
+        ));
+    });
+    let _ = std::fs::write(path, text);
 }
 
 fn toolbar_hit(hwnd: HWND, cursor: POINT) -> Option<ToolbarHit> {
@@ -2044,21 +2894,28 @@ fn toolbar_hit(hwnd: HWND, cursor: POINT) -> Option<ToolbarHit> {
     layout
         .buttons
         .iter()
+        .chain(layout.options.iter())
         .find(|(rect, _)| point_in_rect(local, rect))
         .map(|(_, hit)| *hit)
 }
 
-fn hot_key(hit: Option<ToolbarHit>) -> i32 {
+/// Стабильный идентификатор кнопки для подсветки (не зависит от раскладки).
+fn hit_id(hit: ToolbarHit) -> i32 {
     match hit {
-        None => 0,
-        Some(ToolbarHit::Tool(tool)) => {
-            Tool::ALL
-                .iter()
-                .position(|item| *item == tool)
-                .map_or(0, |index| index as i32 + 1)
-        }
-        Some(ToolbarHit::Copy) => Tool::ALL.len() as i32 + 1,
+        ToolbarHit::Tool(tool) => Tool::ALL
+            .iter()
+            .position(|item| *item == tool)
+            .map_or(0, |index| index as i32 + 1),
+        ToolbarHit::Copy => 100,
+        ToolbarHit::Color(index) => 200 + index as i32,
+        ToolbarHit::Fill => 300,
+        ToolbarHit::IntensitySet(level) => 400 + level,
+        ToolbarHit::IntensityStep(delta) => 420 + i32::from(delta > 0),
     }
+}
+
+fn hot_key(hit: Option<ToolbarHit>) -> i32 {
+    hit.map(hit_id).unwrap_or(0)
 }
 
 fn draw_toolbar(hdc: HDC, layout: &ToolbarLayout, active: Tool, hot: i32, dpi: u32) {
@@ -2093,10 +2950,10 @@ fn draw_toolbar(hdc: HDC, layout: &ToolbarLayout, active: Tool, hot: i32, dpi: u
         }
     }
 
-    for (index, (rect, hit)) in layout.buttons.iter().enumerate() {
+    for (rect, hit) in layout.buttons.iter() {
         let is_copy = matches!(hit, ToolbarHit::Copy);
         let is_active = matches!(hit, ToolbarHit::Tool(tool) if *tool == active);
-        let is_hot = hot == index as i32 + 1;
+        let is_hot = hot == hit_id(*hit);
 
         // Цветное свечение вокруг активной и главной кнопки.
         if is_copy || is_active {
@@ -2126,6 +2983,7 @@ fn draw_toolbar(hdc: HDC, layout: &ToolbarLayout, active: Tool, hot: i32, dpi: u
         let label = match hit {
             ToolbarHit::Tool(tool) => tool.label(),
             ToolbarHit::Copy => "Копировать",
+            _ => "",
         };
         let text = ui::measure_text(hdc, label, font);
         let content_w = icon_size + icon_gap + text.cx;
@@ -2145,9 +3003,119 @@ fn draw_toolbar(hdc: HDC, layout: &ToolbarLayout, active: Tool, hot: i32, dpi: u
         ui::draw_text(hdc, text_x, text_y, label, font, fg);
     }
 
+    draw_toolbar_options(hdc, layout, hot, dpi);
+
     unsafe {
         let _ = DeleteObject(font);
     }
+}
+
+/// Второй ряд панели: палитра, заливка и сила эффекта.
+fn draw_toolbar_options(hdc: HDC, layout: &ToolbarLayout, hot: i32, dpi: u32) {
+    let (active_color, fill_on, intensity) =
+        app::with_state(|s| (s.color, s.fill, s.intensity));
+    let font = ui::make_font(s(11, dpi), 600);
+
+    for (rect, label) in &layout.labels {
+        ui::draw_text(hdc, rect.left, rect.top, label, font, TEXT_MUTED);
+    }
+
+    for (rect, hit) in &layout.options {
+        let is_hot = hot == hit_id(*hit);
+        match hit {
+            ToolbarHit::Color(index) => {
+                let color = PALETTE.get(*index).copied().unwrap_or(WHITE);
+                let selected = color == active_color;
+                let border = if selected {
+                    WHITE
+                } else if is_hot {
+                    ACCENT
+                } else {
+                    GLASS_BORDER
+                };
+                ui::tint_round_rect(
+                    hdc,
+                    rect,
+                    s(6, dpi),
+                    color_bgra(color),
+                    255,
+                    border,
+                    0,
+                );
+                if selected {
+                    let ring = inflate(rect, s(1, dpi));
+                    ui::stroke_round(hdc, &ring, s(6, dpi), WHITE);
+                }
+            }
+            ToolbarHit::Fill => {
+                let (tint, alpha, border, fg) = if fill_on {
+                    (ACCENT_BGRA, 120, ACCENT, WHITE)
+                } else if is_hot {
+                    ([0xFF, 0xFF, 0xFF, 255], 30, ACCENT, WHITE)
+                } else {
+                    ([0xFF, 0xFF, 0xFF, 255], 14, GLASS_BORDER, TEXT_MAIN)
+                };
+                ui::tint_round_rect(hdc, rect, s(7, dpi), tint, alpha, border, 16);
+
+                let dot = s(10, dpi).max(6);
+                let icon = RECT {
+                    left: rect.left + s(8, dpi),
+                    top: (rect.top + rect.bottom - dot) / 2,
+                    right: rect.left + s(8, dpi) + dot,
+                    bottom: (rect.top + rect.bottom - dot) / 2 + dot,
+                };
+                let brush = GdiBrush::solid(if fill_on { WHITE } else { active_color });
+                unsafe {
+                    let _ = FillRect(hdc, &icon, brush.handle());
+                }
+
+                let text = ui::measure_text(hdc, "Заливка", font);
+                let x = icon.right + s(5, dpi);
+                let y = (rect.top + rect.bottom - text.cy) / 2;
+                ui::draw_text(hdc, x, y, "Заливка", font, fg);
+            }
+            ToolbarHit::IntensitySet(level) => {
+                let (tint, alpha, border) = if *level == intensity {
+                    (ACCENT_BGRA, 170, ACCENT)
+                } else if *level < intensity {
+                    (ACCENT_BGRA, 80, GLASS_BORDER)
+                } else if is_hot {
+                    ([0xFF, 0xFF, 0xFF, 255], 26, ACCENT)
+                } else {
+                    ([0xFF, 0xFF, 0xFF, 255], 12, GLASS_BORDER)
+                };
+                ui::tint_round_rect(hdc, rect, s(4, dpi), tint, alpha, border, 0);
+            }
+            ToolbarHit::IntensityStep(delta) => {
+                let (tint, alpha, border, fg) = if is_hot {
+                    ([0xFF, 0xFF, 0xFF, 255], 30, ACCENT, WHITE)
+                } else {
+                    ([0xFF, 0xFF, 0xFF, 255], 14, GLASS_BORDER, TEXT_MAIN)
+                };
+                ui::tint_round_rect(hdc, rect, s(6, dpi), tint, alpha, border, 12);
+                let label = if *delta < 0 { "−" } else { "+" };
+                let text = ui::measure_text(hdc, label, font);
+                let x = (rect.left + rect.right - text.cx) / 2;
+                let y = (rect.top + rect.bottom - text.cy) / 2;
+                ui::draw_text(hdc, x, y, label, font, fg);
+            }
+            _ => {}
+        }
+    }
+
+    unsafe {
+        let _ = DeleteObject(font);
+    }
+}
+
+fn color_bgra(color: u32) -> [u8; 4] {
+    // COLORREF — 0x00BBGGRR, а AlphaBlend ждёт BGRA.
+    [
+        ((color >> 16) & 0xFF) as u8,
+        ((color >> 8) & 0xFF) as u8,
+        (color & 0xFF) as u8,
+        255,
+    ]
 }
 
 /// Иконки инструментов рисуются простыми GDI-примитивами: без внешних
@@ -2275,6 +3243,25 @@ fn draw_tool_icon(hdc: HDC, area: &RECT, hit: ToolbarHit, color: u32, dpi: u32) 
                 SelectObject(hdc, old_pen);
             }
         }
+        ToolbarHit::Tool(Tool::Text) => {
+            // Буква «T» из двух полос.
+            let top = RECT {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + t,
+            };
+            let stem = RECT {
+                left: x + (w - t) / 2,
+                top: y,
+                right: x + (w - t) / 2 + t,
+                bottom: y + h,
+            };
+            unsafe {
+                let _ = FillRect(hdc, &top, brush.handle());
+                let _ = FillRect(hdc, &stem, brush.handle());
+            }
+        }
         ToolbarHit::Copy => {
             // Два листа: задний — контуром, передний — заливкой.
             let offset = s(3, dpi).max(2);
@@ -2295,6 +3282,7 @@ fn draw_tool_icon(hdc: HDC, area: &RECT, hit: ToolbarHit, color: u32, dpi: u32) 
                 let _ = FillRect(hdc, &front, brush.handle());
             }
         }
+        _ => {}
     }
 }
 
