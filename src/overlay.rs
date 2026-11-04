@@ -9,8 +9,8 @@
 //! * tools, hints and coordinate/size badges are frosted glass panels.
 //!
 //! The selection stays after the mouse is released, so the user can apply as
-//! many annotations as needed. Enter or «Копировать» finishes the capture,
-//! Esc / right click cancels it.
+//! many annotations as needed. Enter or a single right click finishes the
+//! capture, Esc / middle click / double right click cancels it.
 
 use crate::app::{self, Annotation, Draft, Selection, Tool};
 use crate::capture::{self, CapturedImage};
@@ -21,6 +21,7 @@ use crate::toast;
 use crate::ui;
 use copyx_core::CaptureState;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -41,7 +42,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Controls::{EM_SETSEL, EM_SETLIMITTEXT};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, GetKeyState, SetFocus};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -72,10 +73,10 @@ const PALETTE: [u32; 9] = [
     0x00281E1E, // графит RGB(30, 30, 40)
 ];
 
-/// Непрозрачность заливки фигур по уровню 1–5 (2 — прежнее значение).
-const FILL_SHAPE_ALPHA: [u8; 5] = [40, 70, 105, 145, 195];
+/// Непрозрачность заливки фигур по уровню 1–5: последний уровень — сплошной.
+const FILL_SHAPE_ALPHA: [u8; 5] = [40, 85, 135, 195, 255];
 /// Непрозрачность подложки под текстом по уровню 1–5.
-const FILL_TEXT_ALPHA: [u8; 5] = [150, 190, 220, 240, 250];
+const FILL_TEXT_ALPHA: [u8; 5] = [150, 190, 220, 240, 255];
 
 fn fill_shape_alpha(level: i32) -> u8 {
     FILL_SHAPE_ALPHA[(level.clamp(1, 5) - 1) as usize]
@@ -85,8 +86,20 @@ fn fill_text_alpha(level: i32) -> u8 {
     FILL_TEXT_ALPHA[(level.clamp(1, 5) - 1) as usize]
 }
 
+/// Таймер отложенного копирования по ПКМ: он даёт время на второй клик,
+/// которым пользователь отменяет снимок.
+const TIMER_RMB_COPY: usize = 0x51;
+/// Ждём второй клик не дольше системного интервала двойного щелчка.
+fn rmb_copy_delay() -> u32 {
+    let delay = unsafe { GetDoubleClickTime() };
+    delay.clamp(220, 450)
+}
+
 /// Кисть фона дочернего EDIT: создаётся один раз и живёт до выхода.
 static EDIT_BG: OnceLock<isize> = OnceLock::new();
+
+/// ПКМ нажата один раз и ждёт подтверждения (второй клик отменяет копирование).
+static RMB_COPY_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn edit_bg_brush() -> usize {
     *EDIT_BG.get_or_init(|| unsafe { CreateSolidBrush(COLORREF(PANEL_BG)).0 }) as usize
@@ -120,11 +133,11 @@ unsafe extern "system" fn edit_subclass(
 
 /// Подсказка, пока область ещё не выделена.
 const HINT_SELECT: &str =
-    "Зажмите ЛКМ и выделите область · короткий клик — окно · Esc/СКМ — отмена · ПКМ — копировать";
+    "Зажмите ЛКМ и выделите область · короткий клик — окно · ПКМ — копировать · 2×ПКМ/СКМ — отмена";
 
 /// Подсказка редактора: панель инструментов уже доступна.
 const HINT_EDIT: &str =
-    "1–8 — инструменты · Shift — ровно · C — цвет · F — заливка · [ ] — сила/фон · Enter/ПКМ — копировать · СКМ — отмена";
+    "1–8 — инструменты · Shift — ровно · C — цвет · F — заливка · [ ] — сила/фон · Enter/ПКМ — копировать · 2×ПКМ/СКМ — отмена";
 
 /// Подсказка во время ввода текста.
 const HINT_TEXT: &str = "Введите текст · Enter — добавить · Esc — отмена";
@@ -247,9 +260,11 @@ pub fn hide() {
     });
     if hwnd.0 != 0 {
         unsafe {
+            let _ = KillTimer(hwnd, TIMER_RMB_COPY);
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
     }
+    RMB_COPY_PENDING.store(false, Ordering::SeqCst);
     snapshot::clear();
     clear_back_buffer();
 }
@@ -435,6 +450,9 @@ unsafe extern "system" fn overlay_proc(
             match key {
                 // Esc — снять выделение с фигуры, иначе закрыть оверлей.
                 0x1B => {
+                    if RMB_COPY_PENDING.swap(false, Ordering::SeqCst) {
+                        let _ = KillTimer(hwnd, TIMER_RMB_COPY);
+                    }
                     if app::with_state(|s| s.text_active) {
                         cancel_text();
                         let _ = InvalidateRect(hwnd, None, false);
@@ -514,14 +532,34 @@ unsafe extern "system" fn overlay_proc(
         }
 
         // ПКМ — то же, что Enter: скопировать выделение (или окно под курсором).
+        // ПКМ — то же, что Enter: скопировать выделение (или окно под курсором).
+        // Копирование отложено на время двойного щелчка: второй клик подряд
+        // отменяет снимок, не трогая буфер обмена.
         WM_RBUTTONUP => {
             if app::with_state(|s| s.text_active) {
                 commit_text();
                 let _ = InvalidateRect(hwnd, None, false);
                 return LRESULT(0);
             }
-            if let Some(target) = current_target() {
-                finish_capture(target);
+            if RMB_COPY_PENDING.swap(false, Ordering::SeqCst) {
+                let _ = KillTimer(hwnd, TIMER_RMB_COPY);
+                hide();
+            } else {
+                RMB_COPY_PENDING.store(true, Ordering::SeqCst);
+                let _ = SetTimer(hwnd, TIMER_RMB_COPY, rmb_copy_delay(), None);
+            }
+            LRESULT(0)
+        }
+
+        // Одиночный ПКМ подтверждён: копируем, если второго клика не было.
+        WM_TIMER => {
+            if wparam.0 == TIMER_RMB_COPY {
+                let _ = KillTimer(hwnd, TIMER_RMB_COPY);
+                if RMB_COPY_PENDING.swap(false, Ordering::SeqCst) {
+                    if let Some(target) = current_target() {
+                        finish_capture(target);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -540,6 +578,9 @@ unsafe extern "system" fn overlay_proc(
                 s.rotating = false;
                 s.moving = false;
             });
+            if RMB_COPY_PENDING.swap(false, Ordering::SeqCst) {
+                let _ = KillTimer(hwnd, TIMER_RMB_COPY);
+            }
             LRESULT(0)
         }
 
@@ -573,6 +614,11 @@ unsafe extern "system" fn overlay_proc(
         WM_LBUTTONDOWN => {
             let mut cursor = POINT::default();
             let _ = GetCursorPos(&mut cursor);
+
+            // Клик ЛКМ отменяет отложенное копирование по ПКМ.
+            if RMB_COPY_PENDING.swap(false, Ordering::SeqCst) {
+                let _ = KillTimer(hwnd, TIMER_RMB_COPY);
+            }
 
             // Клик мимо поля ввода завершает текст, а уже потом обрабатывается
             // как обычное нажатие (в том числе по панели).
