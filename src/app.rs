@@ -38,6 +38,8 @@ pub struct AppState {
     pub color: u32,
     /// Заливка: полупрозрачный фон у фигур и подложка под текстом.
     pub fill: bool,
+    /// Интенсивность заливки: 1 (почти прозрачная) – 5 (плотная).
+    pub fill_level: i32,
     /// Сила размытия/пикселизации: 1–5.
     pub intensity: i32,
     /// Открыт ввод текста: дочерний EDIT виден и получает клавиши.
@@ -114,6 +116,8 @@ pub struct Annotation {
     pub color: u32,
     /// Полупрозрачная заливка фигуры или подложка под текстом.
     pub fill: bool,
+    /// Интенсивность заливки: 1–5.
+    pub fill_level: i32,
     /// Текст аннотации (только для Tool::Text).
     pub text: String,
     /// Размер шрифта текста, уже масштабированный под DPI.
@@ -208,6 +212,7 @@ impl Default for AppState {
             move_last: POINT::default(),
             color: 0x004D5AFF,
             fill: false,
+            fill_level: 2,
             intensity: 3,
             text_active: false,
             text_origin: POINT::default(),

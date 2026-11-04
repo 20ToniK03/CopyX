@@ -72,6 +72,19 @@ const PALETTE: [u32; 9] = [
     0x00281E1E, // графит RGB(30, 30, 40)
 ];
 
+/// Непрозрачность заливки фигур по уровню 1–5 (2 — прежнее значение).
+const FILL_SHAPE_ALPHA: [u8; 5] = [40, 70, 105, 145, 195];
+/// Непрозрачность подложки под текстом по уровню 1–5.
+const FILL_TEXT_ALPHA: [u8; 5] = [150, 190, 220, 240, 250];
+
+fn fill_shape_alpha(level: i32) -> u8 {
+    FILL_SHAPE_ALPHA[(level.clamp(1, 5) - 1) as usize]
+}
+
+fn fill_text_alpha(level: i32) -> u8 {
+    FILL_TEXT_ALPHA[(level.clamp(1, 5) - 1) as usize]
+}
+
 /// Кисть фона дочернего EDIT: создаётся один раз и живёт до выхода.
 static EDIT_BG: OnceLock<isize> = OnceLock::new();
 
@@ -107,11 +120,11 @@ unsafe extern "system" fn edit_subclass(
 
 /// Подсказка, пока область ещё не выделена.
 const HINT_SELECT: &str =
-    "Зажмите ЛКМ и выделите область · короткий клик — окно · Esc/ПКМ — отмена";
+    "Зажмите ЛКМ и выделите область · короткий клик — окно · Esc/СКМ — отмена · ПКМ — копировать";
 
 /// Подсказка редактора: панель инструментов уже доступна.
 const HINT_EDIT: &str =
-    "1–8 — инструменты · Shift — ровно · C — цвет · F — заливка · [ ] — сила · Enter — копировать";
+    "1–8 — инструменты · Shift — ровно · C — цвет · F — заливка · [ ] — сила/фон · Enter/ПКМ — копировать · СКМ — отмена";
 
 /// Подсказка во время ввода текста.
 const HINT_TEXT: &str = "Введите текст · Enter — добавить · Esc — отмена";
@@ -133,6 +146,13 @@ enum ToolbarHit {
     IntensitySet(i32),
     /// Уменьшить/увеличить силу на 1.
     IntensityStep(i32),
+}
+
+/// Что регулирует общая шкала «Сила/Фон».
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StyleTarget {
+    Effect,
+    Fill,
 }
 
 struct ToolbarLayout {
@@ -493,7 +513,21 @@ unsafe extern "system" fn overlay_proc(
             LRESULT(0)
         }
 
+        // ПКМ — то же, что Enter: скопировать выделение (или окно под курсором).
         WM_RBUTTONUP => {
+            if app::with_state(|s| s.text_active) {
+                commit_text();
+                let _ = InvalidateRect(hwnd, None, false);
+                return LRESULT(0);
+            }
+            if let Some(target) = current_target() {
+                finish_capture(target);
+            }
+            LRESULT(0)
+        }
+
+        // Нажатие колеса (СКМ) — отмена снимка.
+        WM_MBUTTONUP => {
             hide();
             LRESULT(0)
         }
@@ -558,10 +592,14 @@ unsafe extern "system" fn overlay_proc(
                     }
                     ToolbarHit::Color(index) => set_color(hwnd, index),
                     ToolbarHit::Fill => toggle_fill(hwnd),
-                    ToolbarHit::IntensitySet(value) => set_intensity(hwnd, value, cursor),
+                    ToolbarHit::IntensitySet(value) => set_control_value(hwnd, value, cursor),
                     ToolbarHit::IntensityStep(delta) => {
-                        let value = app::with_state(|s| s.intensity) + delta;
-                        set_intensity(hwnd, value, cursor);
+                        let target = control_target();
+                        let current = app::with_state(|s| match target {
+                            StyleTarget::Effect => s.intensity,
+                            StyleTarget::Fill => s.fill_level,
+                        });
+                        set_control_value(hwnd, current + delta, cursor);
                     }
                 }
                 return LRESULT(0);
@@ -905,11 +943,13 @@ unsafe extern "system" fn overlay_proc(
                                     effect: Some(effect),
                                     color,
                                     fill,
+                                    fill_level: state.fill_level,
                                     text: String::new(),
                                     font_size: 0,
                                     strength,
                                 });
-                                state.selected = None;
+                                // Эффект сразу выделен: его можно тащить мышью.
+                                state.selected = Some(state.annotations.len() - 1);
                             });
                         }
                     } else if big_enough && tool.is_shape() {
@@ -926,6 +966,7 @@ unsafe extern "system" fn overlay_proc(
                                 effect: None,
                                 color,
                                 fill,
+                                fill_level: state.fill_level,
                                 text: String::new(),
                                 font_size: 0,
                                 strength: 0,
@@ -1206,6 +1247,7 @@ fn compose(
                 annotation.font_size,
                 annotation.color,
                 annotation.fill,
+                annotation.fill_level,
                 dpi_at(POINT {
                     x: annotation.start.x,
                     y: annotation.start.y,
@@ -1225,6 +1267,7 @@ fn compose(
                     to,
                     annotation.angle,
                     annotation.color,
+                    annotation.fill_level,
                 );
             }
             paint_shape(
@@ -1280,6 +1323,28 @@ fn style_applies(tool: Tool) -> bool {
     tool.is_shape() || tool == Tool::Text
 }
 
+/// Заливка есть только у квадрата, круга и текста.
+fn fill_applies(tool: Tool) -> bool {
+    matches!(tool, Tool::Rect | Tool::Ellipse | Tool::Text)
+}
+
+/// Какую настройку регулирует общая шкала: силу эффекта или интенсивность фона.
+fn control_target() -> StyleTarget {
+    app::with_state(|s| {
+        if let Some(annotation) = s.selected.and_then(|index| s.annotations.get(index)) {
+            if fill_applies(annotation.tool) {
+                StyleTarget::Fill
+            } else {
+                StyleTarget::Effect
+            }
+        } else if fill_applies(s.tool) {
+            StyleTarget::Fill
+        } else {
+            StyleTarget::Effect
+        }
+    })
+}
+
 /// Выбрать аннотацию и подтянуть панель к её текущему стилю.
 fn select_annotation(index: usize) {
     app::with_state(|s| {
@@ -1290,12 +1355,14 @@ fn select_annotation(index: usize) {
                 a.fill,
                 a.tool.is_effect(),
                 a.strength,
+                a.fill_level,
             )
         });
-        if let Some((styled, color, fill, effect, strength)) = style {
+        if let Some((styled, color, fill, effect, strength, fill_level)) = style {
             if styled {
                 s.color = color;
                 s.fill = fill;
+                s.fill_level = fill_level;
             }
             if effect {
                 s.intensity = strength;
@@ -1380,11 +1447,39 @@ fn set_intensity(hwnd: HWND, value: i32, cursor: POINT) {
     let _ = unsafe { InvalidateRect(hwnd, None, false) };
 }
 
+/// Поменять интенсивность заливки; сразу включаем её, чтобы результат был виден.
+fn set_fill_level(hwnd: HWND, value: i32) {
+    let value = value.clamp(1, 5);
+    app::with_state(|s| {
+        s.fill_level = value;
+        s.fill = true;
+        if let Some(annotation) = s.selected.and_then(|i| s.annotations.get_mut(i)) {
+            if fill_applies(annotation.tool) {
+                annotation.fill = true;
+                annotation.fill_level = value;
+            }
+        }
+    });
+    let _ = unsafe { InvalidateRect(hwnd, None, false) };
+}
+
+/// Общая шкала: сила эффекта или интенсивность заливки — зависит от выделения.
+fn set_control_value(hwnd: HWND, value: i32, cursor: POINT) {
+    match control_target() {
+        StyleTarget::Effect => set_intensity(hwnd, value, cursor),
+        StyleTarget::Fill => set_fill_level(hwnd, value),
+    }
+}
+
 fn change_intensity(hwnd: HWND, delta: i32) {
     let mut cursor = POINT::default();
     let _ = unsafe { GetCursorPos(&mut cursor) };
-    let value = app::with_state(|s| s.intensity) + delta;
-    set_intensity(hwnd, value, cursor);
+    let target = control_target();
+    let current = app::with_state(|s| match target {
+        StyleTarget::Effect => s.intensity,
+        StyleTarget::Fill => s.fill_level,
+    });
+    set_control_value(hwnd, current + delta, cursor);
 }
 
 /// Открыть поле ввода текста в точке `origin` (экранные координаты).
@@ -1510,6 +1605,7 @@ fn commit_text() {
             effect: None,
             color,
             fill,
+            fill_level: s.fill_level,
             text,
             font_size,
             strength: 0,
@@ -1691,6 +1787,7 @@ fn paint_scene(hdc: HDC, window_rect: &RECT, client: &RECT) {
                     s.tool,
                     s.color,
                     s.fill,
+                    s.fill_level,
                     dpi,
                 );
                 let _ = RestoreDC(hdc, saved);
@@ -1787,6 +1884,7 @@ fn paint_annotations(
     tool: Tool,
     color: u32,
     fill: bool,
+    fill_level: i32,
     dpi: u32,
 ) {
     for annotation in annotations {
@@ -1825,6 +1923,7 @@ fn paint_annotations(
                 annotation.font_size,
                 annotation.color,
                 annotation.fill,
+                annotation.fill_level,
                 dpi,
             );
             continue;
@@ -1834,7 +1933,7 @@ fn paint_annotations(
             let from = screen_to_local_point(annotation.start, window);
             let to = screen_to_local_point(annotation.end, window);
             if annotation.fill {
-                paint_shape_fill(hdc, annotation.tool, from, to, annotation.angle, annotation.color);
+                paint_shape_fill(hdc, annotation.tool, from, to, annotation.angle, annotation.color, annotation.fill_level);
             }
             paint_shape(
                 hdc,
@@ -1883,7 +1982,7 @@ fn paint_annotations(
         let from = screen_to_local_point(draft.start, window);
         let to = screen_to_local_point(draft.end, window);
         if fill {
-            paint_shape_fill(hdc, tool, from, to, 0.0, color);
+            paint_shape_fill(hdc, tool, from, to, 0.0, color, fill_level);
         }
         paint_shape(
             hdc,
@@ -2189,6 +2288,13 @@ fn hit_move(annotation: &Annotation, point: POINT, dpi: u32) -> bool {
                 && local.y >= rect.top - pad
                 && local.y <= rect.bottom + pad
         }
+        Tool::Pixelate | Tool::Blur => {
+            let pad = tolerance as i32;
+            point.x >= rect.left - pad
+                && point.x <= rect.right + pad
+                && point.y >= rect.top - pad
+                && point.y <= rect.bottom + pad
+        }
         _ => false,
     }
 }
@@ -2389,7 +2495,15 @@ fn draw_annotation_selection(
 }
 
 /// Полупрозрачная заливка внутри контура фигуры.
-fn paint_shape_fill(hdc: HDC, tool: Tool, from: POINT, to: POINT, angle: f32, color: u32) {
+fn paint_shape_fill(
+    hdc: HDC,
+    tool: Tool,
+    from: POINT,
+    to: POINT,
+    angle: f32,
+    color: u32,
+    fill_level: i32,
+) {
     let points: Vec<POINT> = match tool {
         Tool::Rect => shape_corners(from, to, angle).to_vec(),
         Tool::Ellipse => ellipse_points(from, to, angle, 96),
@@ -2403,7 +2517,7 @@ fn paint_shape_fill(hdc: HDC, tool: Tool, from: POINT, to: POINT, angle: f32, co
         return;
     }
     let bounds = bounds_of(&points);
-    fill_region(hdc, region, &bounds, color, 70);
+    fill_region(hdc, region, &bounds, color, fill_shape_alpha(fill_level));
 }
 
 /// Подложка под текстом — тёмное полупрозрачное стекло.
@@ -2415,6 +2529,7 @@ fn paint_text(
     font_size: i32,
     color: u32,
     fill: bool,
+    fill_level: i32,
     dpi: u32,
 ) {
     let rect = normalized(from, to);
@@ -2437,7 +2552,7 @@ fn paint_text(
             )
         };
         if !region.is_invalid() {
-            fill_region(hdc, region, &rect, PANEL_BG, 190);
+            fill_region(hdc, region, &rect, PANEL_BG, fill_text_alpha(fill_level));
         }
     }
 
@@ -2640,7 +2755,14 @@ fn toolbar_layout(
     let pip_gap = s(4, dpi);
 
     let color_label_w = ui::measure_text(hdc, "Цвет", label_font).cx;
-    let strength_label_w = ui::measure_text(hdc, "Сила", label_font).cx;
+    let strength_label_w = ui::measure_text(hdc, "Сила", label_font)
+        .cx
+        .max(ui::measure_text(hdc, "Фон", label_font).cx);
+    let control_label = if control_target() == StyleTarget::Fill {
+        "Фон"
+    } else {
+        "Сила"
+    };
     let fill_text_w = ui::measure_text(hdc, "Заливка", label_font).cx;
     let fill_w = fill_text_w + s(26, dpi) + pad_x;
 
@@ -2779,7 +2901,7 @@ fn toolbar_layout(
             right: x + strength_label_w,
             bottom: label_y + label_h,
         },
-        "Сила",
+        control_label,
     ));
     x += strength_label_w + label_gap;
 
@@ -2846,10 +2968,11 @@ fn dump_layout(layout: &ToolbarLayout) {
     app::with_state(|s| {
         for (index, annotation) in s.annotations.iter().enumerate() {
             text.push_str(&format!(
-                "ann#{} {:?} fill={} color={:06X} strength={} text={:?} rect={} {} {} {}\n",
+                "ann#{} {:?} fill={} level={} color={:06X} strength={} text={:?} rect={} {} {} {}\n",
                 index,
                 annotation.tool,
                 annotation.fill,
+                annotation.fill_level,
                 annotation.color,
                 annotation.strength,
                 annotation.text,
@@ -2860,8 +2983,8 @@ fn dump_layout(layout: &ToolbarLayout) {
             ));
         }
         text.push_str(&format!(
-            "state fill={} color={:06X} intensity={} selected={:?}\n",
-            s.fill, s.color, s.intensity, s.selected
+            "state fill={} level={} color={:06X} intensity={} tool={:?} sel_active={} selected={:?}\n",
+            s.fill, s.fill_level, s.color, s.intensity, s.tool, s.selection.active, s.selected
         ));
     });
     let _ = std::fs::write(path, text);
@@ -3012,8 +3135,12 @@ fn draw_toolbar(hdc: HDC, layout: &ToolbarLayout, active: Tool, hot: i32, dpi: u
 
 /// Второй ряд панели: палитра, заливка и сила эффекта.
 fn draw_toolbar_options(hdc: HDC, layout: &ToolbarLayout, hot: i32, dpi: u32) {
-    let (active_color, fill_on, intensity) =
-        app::with_state(|s| (s.color, s.fill, s.intensity));
+    let (active_color, fill_on, intensity, fill_level) =
+        app::with_state(|s| (s.color, s.fill, s.intensity, s.fill_level));
+    let control_value = match control_target() {
+        StyleTarget::Effect => intensity,
+        StyleTarget::Fill => fill_level,
+    };
     let font = ui::make_font(s(11, dpi), 600);
 
     for (rect, label) in &layout.labels {
@@ -3075,9 +3202,9 @@ fn draw_toolbar_options(hdc: HDC, layout: &ToolbarLayout, hot: i32, dpi: u32) {
                 ui::draw_text(hdc, x, y, "Заливка", font, fg);
             }
             ToolbarHit::IntensitySet(level) => {
-                let (tint, alpha, border) = if *level == intensity {
+                let (tint, alpha, border) = if *level == control_value {
                     (ACCENT_BGRA, 170, ACCENT)
-                } else if *level < intensity {
+                } else if *level < control_value {
                     (ACCENT_BGRA, 80, GLASS_BORDER)
                 } else if is_hot {
                     ([0xFF, 0xFF, 0xFF, 255], 26, ACCENT)
