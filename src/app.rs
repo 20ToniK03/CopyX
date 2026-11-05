@@ -34,6 +34,9 @@ pub struct AppState {
     pub moving: bool,
     /// Позиция курсора на предыдущем шаге перетаскивания.
     pub move_last: POINT,
+    /// Прежняя рамка на время перевыделения: если пользователь просто
+    /// кликнул по пустому месту, рамка и аннотации возвращаются.
+    pub reclaim_selection: Option<Selection>,
     /// Цвет линий фигур и текста (COLORREF).
     pub color: u32,
     /// Заливка: полупрозрачный фон у фигур и подложка под текстом.
@@ -210,6 +213,7 @@ impl Default for AppState {
             rotating: false,
             moving: false,
             move_last: POINT::default(),
+            reclaim_selection: None,
             color: 0x004D5AFF,
             fill: false,
             fill_level: 2,

@@ -137,7 +137,7 @@ const HINT_SELECT: &str =
 
 /// Подсказка редактора: панель инструментов уже доступна.
 const HINT_EDIT: &str =
-    "1–8 — инструменты · Shift — ровно · C — цвет · F — заливка · [ ] — сила/фон · Enter/ПКМ — копировать · 2×ПКМ/СКМ — отмена";
+    "1–8 — инструменты · Shift — ровно · C — цвет · F — заливка · [ ] — сила/фон · пустое место — новая рамка · Enter/ПКМ — копировать · 2×ПКМ/СКМ — отмена";
 
 /// Подсказка во время ввода текста.
 const HINT_TEXT: &str = "Введите текст · Enter — добавить · Esc — отмена";
@@ -220,6 +220,7 @@ pub fn show(instance: HINSTANCE) {
         s.selected = None;
         s.rotating = false;
         s.moving = false;
+        s.reclaim_selection = None;
     });
 
     unsafe {
@@ -256,6 +257,7 @@ pub fn hide() {
         s.selected = None;
         s.rotating = false;
         s.moving = false;
+        s.reclaim_selection = None;
         s.overlay_hwnd
     });
     if hwnd.0 != 0 {
@@ -577,6 +579,7 @@ unsafe extern "system" fn overlay_proc(
                 s.pointer_down = false;
                 s.rotating = false;
                 s.moving = false;
+                s.reclaim_selection = None;
             });
             if RMB_COPY_PENDING.swap(false, Ordering::SeqCst) {
                 let _ = KillTimer(hwnd, TIMER_RMB_COPY);
@@ -593,9 +596,13 @@ unsafe extern "system" fn overlay_proc(
             let over_move = !over_handle && move_hit_at(cursor, dpi).is_some();
             let over_shape = !over_handle
                 && !over_move
-                && app::with_state(|s| s.tool == Tool::Select && !s.rotating)
-                && (hit_annotation_at(cursor, dpi).is_some()
-                    || hit_interior_at(cursor).is_some());
+                && app::with_state(|s| {
+                    s.tool == Tool::Select
+                        && !s.rotating
+                        && s.selection.active
+                        && point_in_rect(cursor, &app::selection_rect(&s.selection))
+                })
+                && pick_at(cursor, dpi).is_some();
             let shape = if over_toolbar {
                 IDC_ARROW
             } else if over_move {
@@ -686,23 +693,28 @@ unsafe extern "system" fn overlay_proc(
 
             let (selection, tool) = app::with_state(|s| (s.selection, s.tool));
 
-            // Инструмент «Область»: текст и эффекты выбираются кликом внутри,
-            // фигуры — по контуру.
-            if tool == Tool::Select {
-                if let Some(index) =
-                    hit_interior_at(cursor).or_else(|| hit_annotation_at(cursor, dpi))
-                {
-                    select_annotation(index);
-                    let _ = InvalidateRect(hwnd, None, false);
-                    return LRESULT(0);
-                }
-            }
-
             let sel_rect = app::selection_rect(&selection);
             let inside_selection = selection.active
                 && sel_rect.right - sel_rect.left > 4
                 && sel_rect.bottom - sel_rect.top > 4
                 && point_in_rect(cursor, &sel_rect);
+
+            // Инструмент «Область»: элемент под курсором выбираем и сразу
+            // даём тащить. Залитые фигуры, текст и эффекты ловятся телом,
+            // контурные фигуры и линии — по линии. Клики вне рамки не
+            // выбирают невидимые (обрезанные) аннотации.
+            if tool == Tool::Select && inside_selection {
+                if let Some(index) = pick_at(cursor, dpi) {
+                    select_annotation(index);
+                    app::with_state(|s| {
+                        s.moving = true;
+                        s.pointer_down = true;
+                        s.move_last = cursor;
+                    });
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
+            }
 
             // «Текст»: клик внутри области открывает поле ввода в этой точке.
             if inside_selection && tool == Tool::Text {
@@ -710,9 +722,24 @@ unsafe extern "system" fn overlay_proc(
                 return LRESULT(0);
             }
 
-            // «Область»: клик по пустому месту внутри выделения ничего не
-            // меняет — иначе случайное нажатие стёрло бы все аннотации.
+            // «Область» на пустом месте внутри выделения: начинаем новую
+            // рамку, не уходя за край экрана. Если это окажется просто клик,
+            // старая рамка и аннотации вернутся на отпускании кнопки.
             if inside_selection && tool == Tool::Select {
+                app::with_state(|s| {
+                    s.reclaim_selection = Some(s.selection);
+                    s.pointer_down = true;
+                    s.selection.active = false;
+                    s.selection.start = cursor;
+                    s.selection.current = cursor;
+                    s.hover_window = HWND(0);
+                    s.hover_rect = RECT::default();
+                    s.draft = None;
+                    s.rotating = false;
+                    s.moving = false;
+                    s.capture_state = CaptureState::OverlayShown;
+                });
+                let _ = InvalidateRect(hwnd, None, false);
                 return LRESULT(0);
             }
 
@@ -1030,12 +1057,31 @@ unsafe extern "system" fn overlay_proc(
 
             // Отпустили кнопку после выделения области: не копируем сразу,
             // а оставляем рамку — пользователь может добавить аннотации.
-            let (was_selecting, hover_rect) = app::with_state(|s| {
+            let (was_selecting, hover_rect, reclaim) = app::with_state(|s| {
                 s.pointer_down = false;
                 s.selection.current = cursor;
                 s.capture_state = CaptureState::OverlayShown;
-                (s.selection.active, s.hover_rect)
+                (
+                    s.selection.active,
+                    s.hover_rect,
+                    s.reclaim_selection.take(),
+                )
             });
+
+            if let Some(old) = reclaim {
+                if !was_selecting {
+                    // Это был обычный клик по пустому месту: возвращаем рамку.
+                    app::with_state(|s| s.selection = old);
+                }
+                // Аннотации не трогаем: рамку можно уменьшить, не теряя их —
+                // они просто обрежутся по новым границам.
+                app::with_state(|s| {
+                    s.hover_window = HWND(0);
+                    s.hover_rect = RECT::default();
+                });
+                let _ = InvalidateRect(hwnd, None, false);
+                return LRESULT(0);
+            }
 
             let hover_valid = hover_rect.right - hover_rect.left > 2
                 && hover_rect.bottom - hover_rect.top > 2;
@@ -1113,6 +1159,7 @@ fn select_all(hwnd: HWND) {
         s.annotations.clear();
         s.draft = None;
         s.selected = None;
+        s.reclaim_selection = None;
         s.capture_state = CaptureState::Selecting;
     });
     let _ = unsafe { InvalidateRect(hwnd, None, false) };
@@ -2217,52 +2264,50 @@ fn near_ellipse_outline(point: POINT, rect: &RECT, tolerance: f32) -> bool {
     (radius - 1.0).abs() * rx.min(ry) <= tolerance
 }
 
-/// Ближайшая к курсору фигура (только контур, чтобы клики внутри рамки
-/// не мешали новому выделению).
-fn hit_annotation(annotations: &[Annotation], point: POINT, dpi: u32) -> Option<usize> {
-    let base = s(7, dpi).max(5) as f32;
-    for (index, annotation) in annotations.iter().enumerate().rev() {
-        if !annotation.tool.is_shape() {
-            continue;
-        }
-        let tolerance = base + annotation.width as f32;
-        let local = rotate_point(point, annotation.center(), -annotation.angle);
-        let rect = annotation.bounds();
-        let hit = match annotation.tool {
-            Tool::Line | Tool::Arrow => {
-                distance_to_segment(local, annotation.start, annotation.end) <= tolerance
-            }
-            Tool::Rect => near_rect_outline(local, &rect, tolerance),
-            Tool::Ellipse => near_ellipse_outline(local, &rect, tolerance),
-            _ => false,
-        };
-        if hit {
-            return Some(index);
-        }
+/// Попадание в контур фигуры (линия, стрелка, рамка, эллипс).
+fn shape_outline_hit(annotation: &Annotation, point: POINT, dpi: u32) -> bool {
+    if !annotation.tool.is_shape() {
+        return false;
     }
-    None
+    let base = s(7, dpi).max(5) as f32;
+    let tolerance = base + annotation.width as f32;
+    let local = rotate_point(point, annotation.center(), -annotation.angle);
+    let rect = annotation.bounds();
+    match annotation.tool {
+        Tool::Line | Tool::Arrow => {
+            distance_to_segment(local, annotation.start, annotation.end) <= tolerance
+        }
+        Tool::Rect => near_rect_outline(local, &rect, tolerance),
+        Tool::Ellipse => near_ellipse_outline(local, &rect, tolerance),
+        _ => false,
+    }
 }
 
-fn hit_annotation_at(point: POINT, dpi: u32) -> Option<usize> {
-    app::with_state(|s| hit_annotation(&s.annotations, point, dpi))
-}
-
-/// Аннотации, которые выбираются кликом внутри: текст и эффекты.
-fn hit_interior_at(point: POINT) -> Option<usize> {
+/// Аннотация под курсором для инструмента «Область». Залитые фигуры, текст и
+/// эффекты ловятся телом, контурные фигуры и линии — по линии: клик мимо них
+/// начинает новое выделение.
+fn pick_at(point: POINT, dpi: u32) -> Option<usize> {
     app::with_state(|s| {
         s.annotations
             .iter()
             .enumerate()
             .rev()
-            .find_map(|(index, annotation)| match annotation.tool {
-                Tool::Text | Tool::Pixelate | Tool::Blur => {
-                    if point_in_rect(point, &annotation.bounds()) {
-                        Some(index)
-                    } else {
-                        None
+            .find_map(|(index, annotation)| {
+                let hit = match annotation.tool {
+                    Tool::Text | Tool::Pixelate | Tool::Blur => {
+                        point_in_rect(point, &annotation.bounds())
                     }
+                    Tool::Rect | Tool::Ellipse => {
+                        annotation.fill && hit_move(annotation, point, dpi)
+                    }
+                    Tool::Line | Tool::Arrow => shape_outline_hit(annotation, point, dpi),
+                    Tool::Select => false,
+                };
+                if hit {
+                    Some(index)
+                } else {
+                    None
                 }
-                _ => None,
             })
     })
 }
@@ -3028,9 +3073,20 @@ fn dump_layout(layout: &ToolbarLayout) {
                 annotation.end.y
             ));
         }
+        let sel = app::selection_rect(&s.selection);
         text.push_str(&format!(
-            "state fill={} level={} color={:06X} intensity={} tool={:?} sel_active={} selected={:?}\n",
-            s.fill, s.fill_level, s.color, s.intensity, s.tool, s.selection.active, s.selected
+            "state fill={} level={} color={:06X} intensity={} tool={:?} sel_active={} selected={:?} sel={} {} {} {}\n",
+            s.fill,
+            s.fill_level,
+            s.color,
+            s.intensity,
+            s.tool,
+            s.selection.active,
+            s.selected,
+            sel.left,
+            sel.top,
+            sel.right,
+            sel.bottom
         ));
     });
     let _ = std::fs::write(path, text);
