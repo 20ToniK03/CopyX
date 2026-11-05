@@ -137,7 +137,7 @@ const HINT_SELECT: &str =
 
 /// Подсказка редактора: панель инструментов уже доступна.
 const HINT_EDIT: &str =
-    "1–8 — инструменты · Shift — ровно · C — цвет · F — заливка · [ ] — сила/фон · пустое место — новая рамка · Enter/ПКМ — копировать · 2×ПКМ/СКМ — отмена";
+    "1–8 — инструменты · Shift — ровно · C — цвет · F — заливка · [ ] — сила/фон · пустое место — новая рамка · клик по окну — выбор окна · Enter/ПКМ — копировать · 2×ПКМ/СКМ — отмена";
 
 /// Подсказка во время ввода текста.
 const HINT_TEXT: &str = "Введите текст · Enter — добавить · Esc — отмена";
@@ -419,6 +419,17 @@ unsafe extern "system" fn window_search_proc(hwnd: HWND, lparam: LPARAM) -> BOOL
 
     ctx.result = hwnd;
     BOOL(0)
+}
+
+/// Рабочий стол Windows: клик по нему не должен менять текущую рамку.
+unsafe fn is_desktop_window(hwnd: HWND) -> bool {
+    let mut buf = [0u16; 32];
+    let len = GetClassNameW(hwnd, &mut buf);
+    if len <= 0 {
+        return false;
+    }
+    let class = String::from_utf16_lossy(&buf[..len as usize]);
+    class == "Progman" || class == "WorkerW"
 }
 
 unsafe fn window_frame_rect(hwnd: HWND) -> RECT {
@@ -758,7 +769,8 @@ unsafe extern "system" fn overlay_proc(
                 return LRESULT(0);
             }
 
-            // Новое выделение: старые аннотации к нему уже не относятся.
+            // Новое выделение. Аннотации не стираем: они живут до отмены или
+            // копирования и просто обрезаются по границам новой рамки.
             let (candidate, bounds) = window_at_point(cursor, hwnd);
             app::with_state(|s| {
                 s.pointer_down = true;
@@ -767,7 +779,6 @@ unsafe extern "system" fn overlay_proc(
                 s.selection.current = cursor;
                 s.hover_window = candidate;
                 s.hover_rect = bounds;
-                s.annotations.clear();
                 s.draft = None;
                 s.selected = None;
                 s.rotating = false;
@@ -1069,12 +1080,52 @@ unsafe extern "system" fn overlay_proc(
             });
 
             if let Some(old) = reclaim {
-                if !was_selecting {
-                    // Это был обычный клик по пустому месту: возвращаем рамку.
-                    app::with_state(|s| s.selection = old);
-                }
-                // Аннотации не трогаем: рамку можно уменьшить, не теряя их —
+                // Аннотации не трогаем: рамку можно менять, не теряя их —
                 // они просто обрежутся по новым границам.
+                if was_selecting {
+                    // Рамку уменьшили протяжкой. Сбрасываем выделение
+                    // элемента, чтобы его рамка не висела за границей.
+                    app::with_state(|s| {
+                        s.selected = None;
+                        s.rotating = false;
+                        s.moving = false;
+                    });
+                } else {
+                    // Обычный клик по пустому месту. Если под курсором окно
+                    // поменьше текущей рамки — выделяем его, иначе оставляем
+                    // прежнюю рамку (клик по фону ничего не меняет).
+                    let old_rect = app::selection_rect(&old);
+                    let (candidate, bounds) = unsafe { window_at_point(cursor, hwnd) };
+                    let old_area = (old_rect.right - old_rect.left) as i64
+                        * (old_rect.bottom - old_rect.top) as i64;
+                    let new_area = (bounds.right - bounds.left) as i64
+                        * (bounds.bottom - bounds.top) as i64;
+                    let smaller_window = candidate.0 != 0
+                        && !unsafe { is_desktop_window(candidate) }
+                        && bounds.right - bounds.left > 2
+                        && bounds.bottom - bounds.top > 2
+                        && !same_rect(&bounds, &old_rect)
+                        && new_area < old_area;
+
+                    if smaller_window {
+                        app::with_state(|s| {
+                            s.selection.active = true;
+                            s.selection.start = POINT {
+                                x: bounds.left,
+                                y: bounds.top,
+                            };
+                            s.selection.current = POINT {
+                                x: bounds.right,
+                                y: bounds.bottom,
+                            };
+                            s.selected = None;
+                            s.rotating = false;
+                            s.moving = false;
+                        });
+                    } else {
+                        app::with_state(|s| s.selection = old);
+                    }
+                }
                 app::with_state(|s| {
                     s.hover_window = HWND(0);
                     s.hover_rect = RECT::default();
@@ -1156,7 +1207,6 @@ fn select_all(hwnd: HWND) {
             x: rect.right,
             y: rect.bottom,
         };
-        s.annotations.clear();
         s.draft = None;
         s.selected = None;
         s.reclaim_selection = None;
