@@ -2334,8 +2334,8 @@ fn shape_outline_hit(annotation: &Annotation, point: POINT, dpi: u32) -> bool {
 }
 
 /// Аннотация под курсором для инструмента «Область». Залитые фигуры, текст и
-/// эффекты ловятся телом, контурные фигуры и линии — по линии: клик мимо них
-/// начинает новое выделение.
+/// эффекты ловятся телом, незалитые фигуры и линии — по контуру: клик мимо
+/// контура начинает новое выделение.
 fn pick_at(point: POINT, dpi: u32) -> Option<usize> {
     app::with_state(|s| {
         s.annotations
@@ -2348,7 +2348,11 @@ fn pick_at(point: POINT, dpi: u32) -> Option<usize> {
                         point_in_rect(point, &annotation.bounds())
                     }
                     Tool::Rect | Tool::Ellipse => {
-                        annotation.fill && hit_move(annotation, point, dpi)
+                        if annotation.fill {
+                            hit_move(annotation, point, dpi)
+                        } else {
+                            shape_outline_hit(annotation, point, dpi)
+                        }
                     }
                     Tool::Line | Tool::Arrow => shape_outline_hit(annotation, point, dpi),
                     Tool::Select => false,
