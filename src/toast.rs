@@ -134,9 +134,6 @@ pub fn show(image: CapturedImage, clipboard_ok: bool) {
     let hide_text = "Скрыть";
     let save_w = ui::measure_text(screen.handle(), save_text, font_btn).cx + sc(32);
     let hide_w = ui::measure_text(screen.handle(), hide_text, font_btn).cx + sc(24);
-    unsafe {
-        let _ = DeleteObject(font_btn);
-    }
 
     let save_rect = RECT {
         left: width - pad - save_w,
@@ -226,9 +223,6 @@ pub fn show_status(title: &str, lines: &[&str]) {
     let screen = ScreenDc::for_screen();
     let font_btn = ui::make_font(sc(13), 600);
     let hide_w = ui::measure_text(screen.handle(), "Скрыть", font_btn).cx + sc(24);
-    unsafe {
-        let _ = DeleteObject(font_btn);
-    }
 
     let hide_rect = RECT {
         left: width - pad - hide_w,
@@ -623,6 +617,9 @@ unsafe extern "system" fn toast_proc(
             if let Ok(mut frame) = TOAST_FRAME.lock() {
                 *frame = None;
             }
+            // Снимок и backdrop тоста уже отпущены — возвращаем страницы
+            // системе, чтобы в простое процесс снова занимал единицы МБ.
+            crate::app::trim_memory();
             LRESULT(0)
         }
 
@@ -768,18 +765,12 @@ fn paint_toast_scene(hdc: HDC, client: &RECT) {
         title_font,
         TEXT_MAIN,
     );
-    unsafe {
-        let _ = DeleteObject(title_font);
-    }
 
     let sub_font = ui::make_font(sc(12), 400);
     let mut line_y = toast.lines_top;
     for line in &toast.lines {
         ui::draw_text(hdc, pad, line_y, line, sub_font, TEXT_MUTED);
         line_y += sc(15) + sc(2);
-    }
-    unsafe {
-        let _ = DeleteObject(sub_font);
     }
 
     draw_button(
@@ -855,9 +846,6 @@ fn draw_button(hdc: HDC, rect: &RECT, text: &str, primary: bool, hot: bool, dpi:
     let y = rect.top + ((rect.bottom - rect.top) - size.cy) / 2;
     let color = TEXT_MAIN;
     ui::draw_text(hdc, x, y, text, font, color);
-    unsafe {
-        let _ = DeleteObject(font);
-    }
 }
 
 fn draw_app_icon(hdc: HDC, rect: &RECT, _dpi: u32) {

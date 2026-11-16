@@ -4,6 +4,8 @@
 //! "Glass" panels are made by alpha-blending a rounded, tinted rectangle over
 //! the already rendered background (frozen screen or acrylic).
 
+use std::sync::Mutex;
+
 use crate::render::{BitmapDc, GdiBrush, GdiPen};
 use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
@@ -65,8 +67,23 @@ unsafe fn work_area_of(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> Opti
     }
 }
 
+/// Кэш шрифтов. `CreateFontW` на каждой перерисовке — заметная доля нагрузки
+/// при перетаскивании, поэтому держим готовые HFONT до выхода из процесса.
+/// Шрифтов всего несколько (размер × начертание), память под них ничтожна.
+static FONTS: Mutex<Vec<(i32, i32, usize)>> = Mutex::new(Vec::new());
+
 pub fn make_font(size: i32, weight: i32) -> HFONT {
-    unsafe {
+    if let Ok(cache) = FONTS.lock() {
+        if let Some(handle) = cache
+            .iter()
+            .find(|(s, w, _)| *s == size && *w == weight)
+            .map(|(_, _, handle)| *handle)
+        {
+            return HFONT(handle as isize);
+        }
+    }
+
+    let font = unsafe {
         CreateFontW(
             size,
             0,
@@ -83,7 +100,14 @@ pub fn make_font(size: i32, weight: i32) -> HFONT {
             DEFAULT_PITCH.0 as u32,
             windows::core::w!("Segoe UI"),
         )
+    };
+
+    if !font.is_invalid() {
+        if let Ok(mut cache) = FONTS.lock() {
+            cache.push((size, weight, font.0 as usize));
+        }
     }
+    font
 }
 
 /// Measure a string with the given font.

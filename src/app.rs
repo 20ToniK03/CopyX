@@ -254,3 +254,25 @@ pub fn selection_rect(sel: &Selection) -> RECT {
         bottom: sel.start.y.max(sel.current.y),
     }
 }
+
+/// Вернуть системе рабочий набор после закрытия больших GDI-буферов.
+///
+/// Освобождённые bitmap'ы оставляют страницы в рабочем наборе процесса, и
+/// Task Manager продолжает показывать десятки мегабайт. Windows подгрузит
+/// нужное обратно при следующем захвате — это заметно дешевле, чем держать
+/// память занятой всё время, пока оверлей закрыт.
+pub fn trim_memory() {
+    use windows::Win32::System::Memory::{
+        SetProcessWorkingSetSizeEx, SETPROCESSWORKINGSETSIZEEX_FLAGS,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    unsafe {
+        let _ = SetProcessWorkingSetSizeEx(
+            GetCurrentProcess(),
+            usize::MAX,
+            usize::MAX,
+            SETPROCESSWORKINGSETSIZEEX_FLAGS(0),
+        );
+    }
+}

@@ -244,6 +244,7 @@ fn main() {
 
         tray::add_icon(hwnd, &tooltip);
         toast::show_started();
+        app::trim_memory();
 
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).0 > 0 {

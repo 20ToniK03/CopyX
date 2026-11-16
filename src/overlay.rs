@@ -206,6 +206,11 @@ pub fn show(instance: HINSTANCE) {
         return;
     }
 
+    // Временные пиксели захвата уже скопированы в GDI-bitmap'ы и отпущены.
+    // Возвращаем их страницы системе, чтобы оверлей не тащил лишние ~14 МБ
+    // рабочего набора, пока пользователь только выбирает область.
+    app::trim_memory();
+
     app::with_state(|s| {
         s.selection = Selection::default();
         s.pointer_down = false;
@@ -269,6 +274,7 @@ pub fn hide() {
     RMB_COPY_PENDING.store(false, Ordering::SeqCst);
     snapshot::clear();
     clear_back_buffer();
+    app::trim_memory();
 }
 
 fn create_overlay(instance: HINSTANCE) {
@@ -1707,9 +1713,6 @@ fn commit_text() {
 
     unsafe {
         let _ = ShowWindow(edit, SW_HIDE);
-        if font.0 != 0 {
-            let _ = DeleteObject(font);
-        }
         if hwnd.0 != 0 {
             let _ = SetFocus(hwnd);
         }
@@ -1759,15 +1762,12 @@ fn commit_text() {
     });
 }
 
-/// Скрыть поле ввода и освободить его шрифт (текст при этом не добавляется).
+/// Скрыть поле ввода (текст при этом не добавляется).
 fn cancel_text() {
-    let (active, edit, font, hwnd) =
-        app::with_state(|s| (s.text_active, s.text_edit, s.text_font, s.overlay_hwnd));
+    let (active, edit, hwnd) =
+        app::with_state(|s| (s.text_active, s.text_edit, s.overlay_hwnd));
     if edit.0 != 0 {
         let _ = unsafe { ShowWindow(edit, SW_HIDE) };
-    }
-    if font.0 != 0 {
-        let _ = unsafe { DeleteObject(font) };
     }
     app::with_state(|s| {
         s.text_active = false;
@@ -2706,9 +2706,6 @@ fn paint_text(
     let x = rect.left + (width - size.cx) / 2;
     let y = rect.top + (height - size.cy) / 2;
     ui::draw_text(hdc, x, y, text, font, color);
-    unsafe {
-        let _ = DeleteObject(font);
-    }
 }
 
 /// Залить область, ограниченную регионом, цветом с прозрачностью.
@@ -2930,11 +2927,6 @@ fn toolbar_layout(
     let panel_w = tools_w.max(options_w) + pad * 2;
     let panel_h = pad * 2 + btn_h + row_gap + opt_h;
     options_w = options_w.min(panel_w - pad * 2);
-
-    unsafe {
-        let _ = DeleteObject(font);
-        let _ = DeleteObject(label_font);
-    }
 
     let monitor = monitor_local_rect(cursor_screen, window);
     let margin = s(12, dpi);
@@ -3283,10 +3275,6 @@ fn draw_toolbar(hdc: HDC, layout: &ToolbarLayout, active: Tool, hot: i32, dpi: u
     }
 
     draw_toolbar_options(hdc, layout, hot, dpi);
-
-    unsafe {
-        let _ = DeleteObject(font);
-    }
 }
 
 /// Второй ряд панели: палитра, заливка и сила эффекта.
@@ -3384,10 +3372,6 @@ fn draw_toolbar_options(hdc: HDC, layout: &ToolbarLayout, hot: i32, dpi: u32) {
             }
             _ => {}
         }
-    }
-
-    unsafe {
-        let _ = DeleteObject(font);
     }
 }
 
@@ -3836,9 +3820,6 @@ fn s(value: i32, dpi: u32) -> i32 {
 fn measure_chip(hdc: HDC, text: &str, font_size: i32, dpi: u32) -> SIZE {
     let font = ui::make_font(font_size, 600);
     let text_size = ui::measure_text(hdc, text, font);
-    unsafe {
-        let _ = DeleteObject(font);
-    }
     SIZE {
         cx: text_size.cx + s(20, dpi),
         cy: text_size.cy + s(10, dpi),
@@ -3874,10 +3855,6 @@ fn draw_chip(
 
     ui::frosted_round_rect(hdc, &rect, s(9, dpi), tint, alpha, border, 30);
     ui::draw_text(hdc, left + pad_x, top + pad_y, text, font, fg);
-
-    unsafe {
-        let _ = DeleteObject(font);
-    }
 
     SIZE {
         cx: rect.right - rect.left,
