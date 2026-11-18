@@ -101,6 +101,40 @@ static EDIT_BG: OnceLock<isize> = OnceLock::new();
 /// ПКМ нажата один раз и ждёт подтверждения (второй клик отменяет копирование).
 static RMB_COPY_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// Таймер анимации подсветки окна при наведении. Крутится только пока под
+/// курсором есть окно, которое можно выделить кликом; в остальное время не
+/// запущен, поэтому лишний CPU не тратится.
+const TIMER_HOVER_ANIM: usize = 0x52;
+const HOVER_ANIM_MS: u32 = 33; // ~30 кадров/с
+const HOVER_FADE_S: f64 = 0.18; // плавное появление подсветки
+const HOVER_BREATH_S: f64 = 1.6; // период мягкого «дыхания» рамки
+
+/// Момент появления текущей подсветки окна; `None` — окна под курсором нет.
+static HOVER_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn start_hover_anim(hwnd: HWND) {
+    *HOVER_SINCE.lock().unwrap() = Some(Instant::now());
+    unsafe {
+        let _ = SetTimer(hwnd, TIMER_HOVER_ANIM, HOVER_ANIM_MS, None);
+    }
+}
+
+fn stop_hover_anim(hwnd: HWND) {
+    *HOVER_SINCE.lock().unwrap() = None;
+    unsafe {
+        let _ = KillTimer(hwnd, TIMER_HOVER_ANIM);
+    }
+}
+
+/// Прогресс появления и фаза «дыхания» для подсветки окна.
+fn hover_anim_state() -> Option<(f32, f32)> {
+    let since = (*HOVER_SINCE.lock().unwrap())?;
+    let secs = since.elapsed().as_secs_f64();
+    let fade = (secs / HOVER_FADE_S).min(1.0) as f32;
+    let breath = 0.5 + 0.5 * (secs / HOVER_BREATH_S * std::f64::consts::TAU).sin();
+    Some((fade, breath as f32))
+}
+
 fn edit_bg_brush() -> usize {
     *EDIT_BG.get_or_init(|| unsafe { CreateSolidBrush(COLORREF(PANEL_BG)).0 }) as usize
 }
@@ -241,6 +275,9 @@ pub fn show(instance: HINSTANCE) {
             s.hover_window = candidate;
             s.hover_rect = bounds;
         });
+        if candidate.0 != 0 && bounds.right - bounds.left > 2 && bounds.bottom - bounds.top > 2 {
+            start_hover_anim(hwnd);
+        }
 
         let _ = InvalidateRect(hwnd, None, false);
         let _ = UpdateWindow(hwnd);
@@ -266,6 +303,7 @@ pub fn hide() {
         s.overlay_hwnd
     });
     if hwnd.0 != 0 {
+        stop_hover_anim(hwnd);
         unsafe {
             let _ = KillTimer(hwnd, TIMER_RMB_COPY);
             let _ = ShowWindow(hwnd, SW_HIDE);
@@ -407,6 +445,12 @@ unsafe extern "system" fn window_search_proc(hwnd: HWND, lparam: LPARAM) -> BOOL
         size_of::<u32>() as u32,
     );
     if cloak_ok.is_ok() && cloaked != 0 {
+        return BOOL(1);
+    }
+
+    // Рабочий стол (Progman/WorkerW) не выделяется: иначе подсветка и её
+    // анимация крутились бы постоянно, пока курсор лежит на пустом фоне.
+    if is_desktop_window(hwnd) {
         return BOOL(1);
     }
 
@@ -579,6 +623,20 @@ unsafe extern "system" fn overlay_proc(
                         finish_capture(target);
                     }
                 }
+            } else if wparam.0 == TIMER_HOVER_ANIM {
+                // Анимация подсветки: продолжаем перерисовку, пока под курсором
+                // есть окно и нет выделения/протяжки; иначе останавливаемся.
+                let keep = app::with_state(|s| {
+                    s.hover_rect.right - s.hover_rect.left > 2
+                        && s.hover_rect.bottom - s.hover_rect.top > 2
+                        && !s.selection.active
+                        && !s.pointer_down
+                });
+                if keep {
+                    let _ = InvalidateRect(hwnd, None, false);
+                } else {
+                    stop_hover_anim(hwnd);
+                }
             }
             LRESULT(0)
         }
@@ -638,6 +696,10 @@ unsafe extern "system" fn overlay_proc(
         WM_LBUTTONDOWN => {
             let mut cursor = POINT::default();
             let _ = GetCursorPos(&mut cursor);
+
+            // Клик начинает выделение/рисование — анимация подсветки окна
+            // больше не нужна, останавливаем её сразу.
+            stop_hover_anim(hwnd);
 
             // Клик ЛКМ отменяет отложенное копирование по ПКМ.
             if RMB_COPY_PENDING.swap(false, Ordering::SeqCst) {
@@ -944,6 +1006,16 @@ unsafe extern "system" fn overlay_proc(
                         changed
                     });
                     if hover_changed || hot_changed {
+                        let valid = candidate.0 != 0
+                            && bounds.right - bounds.left > 2
+                            && bounds.bottom - bounds.top > 2;
+                        if hover_changed {
+                            if valid {
+                                start_hover_anim(hwnd);
+                            } else {
+                                stop_hover_anim(hwnd);
+                            }
+                        }
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                 }
@@ -1948,7 +2020,7 @@ fn paint_scene(hdc: HDC, window_rect: &RECT, client: &RECT) {
         );
     } else if has_hover && !pointer_down {
         let local = screen_to_local(&hover_rect, window_rect);
-        draw_highlight(hdc, &local, dpi);
+        draw_hover_highlight(hdc, &local, dpi);
         draw_size_badge(
             hdc,
             &local,
@@ -3569,6 +3641,46 @@ fn draw_highlight(hdc: HDC, local: &RECT, dpi: u32) {
     ui::stroke_rect(hdc, &outer, 1, GLASS_BORDER);
     ui::stroke_rect(hdc, local, s(2, dpi).max(2), ACCENT);
     draw_corner_ticks(hdc, local, dpi);
+}
+
+/// То же, что `draw_highlight`, но для окна под курсором — с лёгкой анимацией:
+/// рамка плавно «вспыхивает» при появлении и мягко дышит, показывая, что окно
+/// можно выделить кликом. Цвета смешиваются без альфы (GDI), поэтому это
+/// дёшево: только смена оттенка рамки, без новых буферов.
+fn draw_hover_highlight(hdc: HDC, local: &RECT, dpi: u32) {
+    let outer = RECT {
+        left: local.left - 1,
+        top: local.top - 1,
+        right: local.right + 1,
+        bottom: local.bottom + 1,
+    };
+    ui::stroke_rect(hdc, &outer, 1, GLASS_BORDER);
+
+    let accent = match hover_anim_state() {
+        Some((fade, breath)) => {
+            // Яркая вспышка при появлении, затем возврат к обычному цвету,
+            // поверх — мягкое «дыхание» в сторону более светлого оттенка.
+            let flash = lerp_color(WHITE, ACCENT, 0.45);
+            let settled = lerp_color(flash, ACCENT, fade);
+            lerp_color(settled, ACCENT_HOT, breath * 0.4)
+        }
+        None => ACCENT,
+    };
+    ui::stroke_rect(hdc, local, s(2, dpi).max(2), accent);
+    draw_corner_ticks(hdc, local, dpi);
+}
+
+/// Линейно смешать два COLORREF (0x00BBGGRR).
+fn lerp_color(a: u32, b: u32, t: f32) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |ca: u32, cb: u32| (ca as f32 + (cb as f32 - ca as f32) * t).round() as u32;
+    let ar = a & 0xFF;
+    let ag = (a >> 8) & 0xFF;
+    let ab = (a >> 16) & 0xFF;
+    let br = b & 0xFF;
+    let bg = (b >> 8) & 0xFF;
+    let bb = (b >> 16) & 0xFF;
+    mix(ar, br) | (mix(ag, bg) << 8) | (mix(ab, bb) << 16)
 }
 
 /// Белые «уголки» поверх рамки — как ручки выделения.
